@@ -77,7 +77,8 @@ function updateSessionUi() {
   el.host.textContent =
     mode === "hosting" ? "Session beenden" : mode === "joined" ? "Verlassen" : "Session starten";
   el.join.textContent = rejoinable ? "Erneut verbinden" : mode === "joined" ? "Verbunden" : "Beitreten";
-  el.host.disabled = mode === "joined" && connected;
+  // Host-Button ist in jedem Modus die aktive Aktion (Starten/Beenden/Verlassen)
+  el.host.disabled = false;
   el.join.disabled = mode === "hosting" || (mode === "joined" && connected);
   el.joinInput.disabled = mode !== "idle";
   el.open.disabled = mode !== "idle";
