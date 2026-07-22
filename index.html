@@ -15,8 +15,10 @@
           <button id="btn-save" title="Speichern (Strg+S)">Speichern</button>
         </div>
         <div class="group">
-          <button id="btn-host" title="Kommt in Meilenstein 3" disabled>Session starten</button>
-          <button id="btn-join" title="Kommt in Meilenstein 3" disabled>Beitreten</button>
+          <button id="btn-host" title="Als Host lauschen (LAN/M2)">Session starten</button>
+          <input id="join-input" placeholder="ip:port" spellcheck="false" />
+          <button id="btn-join" title="Mit Host-Code verbinden">Beitreten</button>
+          <span id="session-code" class="code muted"></span>
         </div>
         <div id="file-label" class="muted">Keine Datei geöffnet</div>
       </header>

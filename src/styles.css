@@ -51,6 +51,31 @@ body,
   cursor: default;
 }
 
+#join-input {
+  width: 9.5rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid light-dark(#ccc, #444);
+  border-radius: 6px;
+  background: light-dark(#fff, #1e1e1e);
+  color: inherit;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+#session-code {
+  align-self: center;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+}
+
+#session-code:not(:empty) {
+  background: light-dark(#eef6ee, #223322);
+  color: light-dark(#2d6a2d, #8fbc8f);
+}
+
 #file-label {
   margin-left: auto;
   font-size: 0.8rem;

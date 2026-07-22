@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
@@ -6,11 +7,23 @@ import { basicSetup } from "codemirror";
 import { markdown } from "@codemirror/lang-markdown";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
+import * as awarenessProtocol from "y-protocols/awareness";
+import * as syncProtocol from "y-protocols/sync";
+import * as encoding from "lib0/encoding";
+import * as decoding from "lib0/decoding";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 
+// Nachrichten-Envelope wie bei y-websocket: [Typ-VarUint][Payload]
+const MSG_SYNC = 0;
+const MSG_AWARENESS = 1;
+// Doc-GUID-Ansage: erkennt beim Re-Join, ob der Host inzwischen ein anderes
+// Dokument teilt (dann muss der Gast neu adoptieren statt zu mergen)
+const MSG_META = 2;
+const SESSION_PORT = 41420;
+
 // --- Yjs-Kern: Der Y.Doc ist die Source of Truth, der Editor hängt via yCollab dran.
-// Pro geöffneter Datei ein frischer Doc; bei Sessions (M2/M3) adoptiert der Gast den
-// Host-State — nie zwei unabhängige Historien für denselben Text.
+// Pro geöffneter Datei ein frischer Doc. Beim Session-Beitritt adoptiert der Gast den
+// Host-State (eigener Doc wird leer zurückgesetzt) — nie zwei unabhängige Historien.
 let ydoc = new Y.Doc();
 let ytext = ydoc.getText("content");
 let awareness = new Awareness(ydoc);
@@ -19,11 +32,24 @@ let undoManager = new Y.UndoManager(ytext);
 let currentPath: string | null = null;
 let view: EditorView | null = null;
 
+type Mode = "idle" | "hosting" | "joined";
+let mode: Mode = "idle";
+let connected = false;
+let wiredFor: Y.Doc | null = null;
+// Gast-Seite: GUID des Host-Docs aus der laufenden Session (null = keine Session)
+let hostGuid: string | null = null;
+let lastJoinedAddr: string | null = null;
+
 const el = {
   open: document.querySelector<HTMLButtonElement>("#btn-open")!,
   save: document.querySelector<HTMLButtonElement>("#btn-save")!,
+  host: document.querySelector<HTMLButtonElement>("#btn-host")!,
+  join: document.querySelector<HTMLButtonElement>("#btn-join")!,
+  joinInput: document.querySelector<HTMLInputElement>("#join-input")!,
+  sessionCode: document.querySelector<HTMLSpanElement>("#session-code")!,
   fileLabel: document.querySelector<HTMLDivElement>("#file-label")!,
   editor: document.querySelector<HTMLElement>("#editor")!,
+  statusConn: document.querySelector<HTMLSpanElement>("#status-conn")!,
   statusMsg: document.querySelector<HTMLSpanElement>("#status-msg")!,
 };
 
@@ -42,6 +68,125 @@ function status(msg: string, isError = false) {
   el.statusMsg.classList.toggle("error", isError);
 }
 
+function connStatus(text: string) {
+  el.statusConn.textContent = text;
+}
+
+function updateSessionUi() {
+  const rejoinable = mode === "joined" && !connected;
+  el.host.textContent =
+    mode === "hosting" ? "Session beenden" : mode === "joined" ? "Verlassen" : "Session starten";
+  el.join.textContent = rejoinable ? "Erneut verbinden" : mode === "joined" ? "Verbunden" : "Beitreten";
+  el.host.disabled = mode === "joined" && connected;
+  el.join.disabled = mode === "hosting" || (mode === "joined" && connected);
+  el.joinInput.disabled = mode !== "idle";
+  el.open.disabled = mode !== "idle";
+  if (mode === "idle") el.sessionCode.textContent = "";
+}
+
+// --- Transport-Brücke: Bytes rein/raus über Tauri; der Kanal dahinter ist austauschbar
+// (M2: TCP, M3: WebRTC-DataChannel). Das Protokoll-Framing hier bleibt identisch.
+
+function sendBytes(payload: Uint8Array) {
+  if (!connected) return;
+  void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
+}
+
+function sendHandshake() {
+  if (mode === "hosting") {
+    const encMeta = encoding.createEncoder();
+    encoding.writeVarUint(encMeta, MSG_META);
+    encoding.writeVarString(encMeta, ydoc.guid);
+    sendBytes(encoding.toUint8Array(encMeta));
+  }
+
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, MSG_SYNC);
+  syncProtocol.writeSyncStep1(enc, ydoc);
+  sendBytes(encoding.toUint8Array(enc));
+
+  const enc2 = encoding.createEncoder();
+  encoding.writeVarUint(enc2, MSG_AWARENESS);
+  encoding.writeVarUint8Array(
+    enc2,
+    awarenessProtocol.encodeAwarenessUpdate(awareness, [ydoc.clientID]),
+  );
+  sendBytes(encoding.toUint8Array(enc2));
+}
+
+function wireDoc() {
+  if (wiredFor === ydoc) return;
+  wiredFor = ydoc;
+  ydoc.on("update", (update: Uint8Array, origin: unknown) => {
+    if (origin === "remote" || !connected) return;
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MSG_SYNC);
+    syncProtocol.writeUpdate(enc, update);
+    sendBytes(encoding.toUint8Array(enc));
+  });
+  awareness.on(
+    "update",
+    (
+      changes: { added: number[]; updated: number[]; removed: number[] },
+      origin: unknown,
+    ) => {
+      if (origin === "remote" || !connected) return;
+      const changed = changes.added.concat(changes.updated, changes.removed);
+      const enc = encoding.createEncoder();
+      encoding.writeVarUint(enc, MSG_AWARENESS);
+      encoding.writeVarUint8Array(
+        enc,
+        awarenessProtocol.encodeAwarenessUpdate(awareness, changed),
+      );
+      sendBytes(encoding.toUint8Array(enc));
+    },
+  );
+}
+
+function handleIncoming(data: Uint8Array) {
+  const dec = decoding.createDecoder(data);
+  const type = decoding.readVarUint(dec);
+  if (type === MSG_SYNC) {
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MSG_SYNC);
+    syncProtocol.readSyncMessage(dec, enc, ydoc, "remote");
+    if (encoding.length(enc) > 1) sendBytes(encoding.toUint8Array(enc));
+  } else if (type === MSG_AWARENESS) {
+    awarenessProtocol.applyAwarenessUpdate(
+      awareness,
+      decoding.readVarUint8Array(dec),
+      "remote",
+    );
+  } else if (type === MSG_META) {
+    const guid = decoding.readVarString(dec);
+    if (mode !== "joined") return;
+    if (hostGuid === null) {
+      hostGuid = guid;
+    } else if (hostGuid !== guid) {
+      // Host teilt inzwischen ein ANDERES Dokument: Merge wäre Historien-Mix
+      // (Verdopplungs-Anti-Pattern) — Gast adoptiert stattdessen frisch.
+      hostGuid = guid;
+      resetDoc("");
+      currentPath = null;
+      el.fileLabel.textContent = "(Session-Dokument)";
+      wireDoc();
+      sendHandshake();
+      status("Host teilt ein neues Dokument — Stand übernommen");
+    }
+  }
+}
+
+function clearRemoteAwareness() {
+  const remote = [...awareness.getStates().keys()].filter(
+    (id) => id !== ydoc.clientID,
+  );
+  if (remote.length > 0) {
+    awarenessProtocol.removeAwarenessStates(awareness, remote, "remote");
+  }
+}
+
+// --- Editor ---
+
 function mountEditor() {
   view?.destroy();
   awareness.setLocalStateField("user", localUser());
@@ -59,19 +204,26 @@ function mountEditor() {
 }
 
 function resetDoc(contents: string) {
-  // Frischer Doc pro Datei-Öffnung: kein Merge mit Vorzustand, daher kein
-  // Full-Replace-Anti-Pattern — es existiert noch keine geteilte Historie.
+  // Frischer Doc: kein Merge mit Vorzustand, daher kein Full-Replace-Anti-Pattern —
+  // es existiert keine geteilte Historie mit dem neuen Doc.
   awareness.destroy();
   ydoc.destroy();
+  wiredFor = null;
   ydoc = new Y.Doc();
   ytext = ydoc.getText("content");
-  ytext.insert(0, contents);
+  if (contents.length > 0) ytext.insert(0, contents);
   awareness = new Awareness(ydoc);
   undoManager = new Y.UndoManager(ytext);
   mountEditor();
 }
 
+// --- Datei ---
+
 async function openFile() {
+  if (mode !== "idle") {
+    status("Während einer Session nicht möglich — erst Session beenden", true);
+    return;
+  }
   const path = await open({
     multiple: false,
     filters: [{ name: "Markdown", extensions: ["md", "markdown", "txt"] }],
@@ -107,8 +259,116 @@ async function saveFile() {
   }
 }
 
+// --- Session ---
+
+async function hostSession() {
+  if (mode !== "idle") {
+    // Fungiert in hosting- UND joined-Modus als "Session beenden"/"Verlassen"
+    await leaveSession();
+    return;
+  }
+  try {
+    const code = await invoke<string>("host_session", { port: SESSION_PORT });
+    mode = "hosting";
+    wireDoc();
+    el.sessionCode.textContent = code;
+    el.sessionCode.title = "Klick: Code kopieren";
+    updateSessionUi();
+    status("Code an die Gegenseite geben");
+  } catch (e) {
+    status(String(e), true);
+  }
+}
+
+async function joinSession() {
+  const rejoin = mode === "joined" && !connected;
+  const addr = rejoin ? lastJoinedAddr! : el.joinInput.value.trim();
+  if (!addr || !addr.includes(":")) {
+    status("Adresse als ip:port eingeben", true);
+    return;
+  }
+  if (!rejoin) {
+    // Erst-Beitritt: Gast adoptiert den Host-State — eigener Doc wird leer,
+    // der Sync zieht den Inhalt. Beim Re-Join derselben Session dagegen KEIN
+    // Reset: geteilte Historie existiert, Offline-Edits mergen verlustfrei.
+    resetDoc("");
+    currentPath = null;
+    hostGuid = null;
+    el.fileLabel.textContent = "(Session-Dokument)";
+    mode = "joined";
+    wireDoc();
+  }
+  updateSessionUi();
+  try {
+    await invoke("join_session", { addr });
+    lastJoinedAddr = addr;
+  } catch (e) {
+    if (!rejoin) mode = "idle";
+    updateSessionUi();
+    status(String(e), true);
+  }
+}
+
+async function leaveSession() {
+  await invoke("leave_session").catch(() => {});
+  mode = "idle";
+  connected = false;
+  hostGuid = null;
+  lastJoinedAddr = null;
+  clearRemoteAwareness();
+  updateSessionUi();
+  connStatus("offline");
+  status("");
+}
+
+// --- Events vom Backend ---
+
+void listen<number[]>("net-recv", (e) => {
+  handleIncoming(Uint8Array.from(e.payload));
+});
+
+void listen<string>("net-status", (e) => {
+  const s = e.payload;
+  if (s === "connected") {
+    connected = true;
+    connStatus("verbunden");
+    status("");
+    sendHandshake();
+    updateSessionUi();
+  } else if (s === "listening") {
+    connected = false;
+    connStatus("wartet auf Peer …");
+  } else if (s === "disconnected") {
+    connected = false;
+    clearRemoteAwareness();
+    if (mode === "hosting") {
+      connStatus("wartet auf Peer …");
+    } else if (mode === "joined") {
+      connStatus("getrennt");
+      status("Verbindung verloren — „Erneut verbinden“ merged deine Änderungen", true);
+    }
+    updateSessionUi();
+  } else if (s === "offline") {
+    connected = false;
+    connStatus("offline");
+  }
+});
+
+// --- UI-Verkabelung ---
+
 el.open.addEventListener("click", openFile);
 el.save.addEventListener("click", saveFile);
+el.host.addEventListener("click", hostSession);
+el.join.addEventListener("click", joinSession);
+el.sessionCode.addEventListener("click", () => {
+  const code = el.sessionCode.textContent;
+  if (code) {
+    void navigator.clipboard.writeText(code).then(
+      () => status("Code kopiert"),
+      () => status("Kopieren fehlgeschlagen — Code manuell abtippen", true),
+    );
+  }
+});
 window.addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key === "s") {
     e.preventDefault();
@@ -116,4 +376,5 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+updateSessionUi();
 mountEditor();
