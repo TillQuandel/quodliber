@@ -12,7 +12,19 @@ import * as syncProtocol from "y-protocols/sync";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
-import { authorColoring, authorRuns, paletteFor } from "./author-colors";
+import {
+  authorColoring,
+  authorRuns,
+  authorsRefresh,
+  captureBaseline,
+  clearBaseline,
+  coloringActive,
+  focusedAuthorId,
+  NEUTRAL,
+  paletteFor,
+  toggleColoring,
+  toggleFocus,
+} from "./author-colors";
 
 // Nachrichten-Envelope wie bei y-websocket: [Typ-VarUint][Payload]
 const MSG_SYNC = 0;
@@ -40,6 +52,8 @@ let wiredFor: Y.Doc | null = null;
 // Gast-Seite: GUID des Host-Docs aus der laufenden Session (null = keine Session)
 let hostGuid: string | null = null;
 let lastJoinedAddr: string | null = null;
+// Gast-Seite: Baseline wird nach dem ersten SyncStep2 der Session gesetzt
+let guestBaselinePending = false;
 
 const el = {
   open: document.querySelector<HTMLButtonElement>("#btn-open")!,
@@ -54,6 +68,7 @@ const el = {
   statusConn: document.querySelector<HTMLSpanElement>("#status-conn")!,
   statusMsg: document.querySelector<HTMLSpanElement>("#status-msg")!,
   legend: document.querySelector<HTMLSpanElement>("#author-legend")!,
+  colorsToggle: document.querySelector<HTMLButtonElement>("#btn-colors")!,
 };
 
 // Autoren-Register für die Legende: clientID → Name. Lebt pro Doc-Inkarnation;
@@ -74,19 +89,30 @@ function localUser() {
   return { name, color: pal.color, colorLight: pal.light };
 }
 
+function refreshAuthorUi() {
+  view?.dispatch({ effects: authorsRefresh.of(null) });
+  updateLegend();
+}
+
 function updateLegend() {
-  const clients = new Set(authorRuns(ytext).map((r) => r.client));
-  if (clients.size < 2) {
-    el.legend.innerHTML = "";
-    return;
-  }
   el.legend.innerHTML = "";
+  const runs = authorRuns(ytext);
+  if (!coloringActive(runs)) return;
+  const clients = new Set(
+    runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client),
+  );
   for (const id of clients) {
     const chip = document.createElement("span");
     chip.className = "author-chip";
+    if (focusedAuthorId() === id) chip.classList.add("focused");
     chip.style.backgroundColor = paletteFor(id).light;
     chip.style.borderColor = paletteFor(id).color;
     chip.textContent = authorName(id);
+    chip.title = "Klick: diesen Autor hervorheben";
+    chip.addEventListener("click", () => {
+      toggleFocus(id);
+      refreshAuthorUi();
+    });
     el.legend.appendChild(chip);
   }
 }
@@ -194,8 +220,18 @@ function handleIncoming(data: Uint8Array) {
   if (type === MSG_SYNC) {
     const enc = encoding.createEncoder();
     encoding.writeVarUint(enc, MSG_SYNC);
-    syncProtocol.readSyncMessage(dec, enc, ydoc, "remote");
+    const msgType = syncProtocol.readSyncMessage(dec, enc, ydoc, "remote");
     if (encoding.length(enc) > 1) sendBytes(encoding.toUint8Array(enc));
+    // Gast-Baseline: nach dem ersten vollständigen Host-Stand (SyncStep2) —
+    // ab hier zählt Getipptes als Session-Beitrag, alles davor als Bestand
+    if (
+      guestBaselinePending &&
+      msgType === syncProtocol.messageYjsSyncStep2
+    ) {
+      guestBaselinePending = false;
+      captureBaseline(ydoc);
+      refreshAuthorUi();
+    }
   } else if (type === MSG_AWARENESS) {
     awarenessProtocol.applyAwarenessUpdate(
       awareness,
@@ -213,6 +249,7 @@ function handleIncoming(data: Uint8Array) {
       hostGuid = guid;
       resetDoc("");
       currentPath = null;
+      guestBaselinePending = true;
       el.fileLabel.textContent = "(Session-Dokument)";
       wireDoc();
       sendHandshake();
@@ -256,6 +293,7 @@ function resetDoc(contents: string) {
   ydoc.destroy();
   wiredFor = null;
   authorNames.clear();
+  clearBaseline();
   ydoc = new Y.Doc();
   ytext = ydoc.getText("content");
   if (contents.length > 0) ytext.insert(0, contents);
@@ -320,6 +358,9 @@ async function hostSession() {
     const code = await invoke<string>("host_session", { port: SESSION_PORT });
     mode = "hosting";
     wireDoc();
+    // Session-Baseline: der vorgeladene Datei-Inhalt ist Bestand, kein Autoren-Text
+    captureBaseline(ydoc);
+    refreshAuthorUi();
     el.sessionCode.textContent = code;
     el.sessionCode.title = "Klick: Code kopieren";
     updateSessionUi();
@@ -343,6 +384,7 @@ async function joinSession() {
     resetDoc("");
     currentPath = null;
     hostGuid = null;
+    guestBaselinePending = true;
     el.fileLabel.textContent = "(Session-Dokument)";
     mode = "joined";
     wireDoc();
@@ -364,6 +406,9 @@ async function leaveSession() {
   connected = false;
   hostGuid = null;
   lastJoinedAddr = null;
+  guestBaselinePending = false;
+  // Baseline bleibt: die Session-Färbung („wer hat was geschrieben") überlebt
+  // das Session-Ende, bis eine Datei neu geöffnet wird.
   clearRemoteAwareness();
   updateSessionUi();
   connStatus("offline");
@@ -409,6 +454,11 @@ el.open.addEventListener("click", openFile);
 el.save.addEventListener("click", saveFile);
 el.host.addEventListener("click", hostSession);
 el.join.addEventListener("click", joinSession);
+el.colorsToggle.addEventListener("click", () => {
+  const on = toggleColoring();
+  el.colorsToggle.textContent = on ? "Farben aus" : "Farben an";
+  refreshAuthorUi();
+});
 el.nameInput.value = localStorage.getItem(NAME_STORAGE_KEY) ?? "";
 el.nameInput.addEventListener("change", () => {
   localStorage.setItem(NAME_STORAGE_KEY, el.nameInput.value.trim());

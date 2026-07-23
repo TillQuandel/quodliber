@@ -75,3 +75,60 @@ const runsB = authorRuns(tB);
 assert.deepEqual(runs, runsB, "Attribution replikenidentisch");
 
 console.log(`OK — ${runs.length} Runs, A=${expectA} Zeichen, B=${expectB} Zeichen, Text ${text.length} Zeichen`);
+
+// --- Baseline-Fall: Bestand vor Session-Start wird NEUTRAL (-1) attribuiert ---
+function authorRunsBaseline(ytext, baseline) {
+  const runs = [];
+  let pos = 0;
+  const push = (client, len) => {
+    const last = runs[runs.length - 1];
+    if (last && last.client === client && last.to === pos) last.to = pos + len;
+    else runs.push({ client, from: pos, to: pos + len });
+    pos += len;
+  };
+  let item = ytext._start;
+  while (item !== null) {
+    if (!item.deleted && item.countable) {
+      const client = item.id.client;
+      const len = item.length;
+      const blClock = baseline?.get(client) ?? 0;
+      if (!baseline || item.id.clock >= blClock) push(client, len);
+      else if (item.id.clock + len <= blClock) push(-1, len);
+      else {
+        // Item überspannt die Baseline (Yjs merged benachbarte Items!)
+        const neutralLen = blClock - item.id.clock;
+        push(-1, neutralLen);
+        push(client, len - neutralLen);
+      }
+    }
+    item = item.right;
+  }
+  return runs;
+}
+
+const docC = new Y.Doc();
+const docD = new Y.Doc();
+const tC = docC.getText("content");
+const tD = docD.getText("content");
+tC.insert(0, "Bestand aus der Datei.");
+// Session-Start: Baseline VOR den Session-Edits einfrieren
+const bl = Y.decodeStateVector(Y.encodeStateVector(docC));
+sync(docC, docD);
+tC.insert(tC.length, " C-in-Session.");
+tD.insert(0, "D-in-Session: ");
+sync(docC, docD);
+
+const blRuns = authorRunsBaseline(tC, bl);
+const neutralChars = blRuns
+  .filter((r) => r.client === -1)
+  .reduce((n, r) => n + (r.to - r.from), 0);
+assert.equal(neutralChars, "Bestand aus der Datei.".length, "Bestand neutral");
+const sessionAuthors = new Set(
+  blRuns.filter((r) => r.client !== -1).map((r) => r.client),
+);
+assert.equal(sessionAuthors.size, 2, "beide Session-Autoren attribuiert");
+assert.ok(sessionAuthors.has(docC.clientID) && sessionAuthors.has(docD.clientID));
+
+console.log(
+  `OK Baseline — ${neutralChars} Zeichen Bestand neutral, ${sessionAuthors.size} Session-Autoren`,
+);

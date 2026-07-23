@@ -1,3 +1,4 @@
+import { StateEffect } from "@codemirror/state";
 import {
   Decoration,
   DecorationSet,
@@ -22,6 +23,45 @@ export const PALETTE = [
 
 export const paletteFor = (clientId: number) => PALETTE[clientId % PALETTE.length];
 
+/** Signalisiert dem Editor, dass Autoren-Darstellung neu gerechnet werden muss
+ * (Baseline gesetzt, Fokus gewechselt, Färbung an/aus). */
+export const authorsRefresh = StateEffect.define<null>();
+
+/** Marker für Bestand von vor der Session (wird nie gefärbt). */
+export const NEUTRAL = -1;
+
+// Session-Baseline: State-Vector zum Session-Start. Alles, was ein Client davor
+// geschrieben hat (item.clock < baseline[client]), zählt als neutraler Bestand —
+// gefärbt wird nur, was WÄHREND der Session entsteht (Realtest-Fund: der Host
+// ist nicht "Autor" des vorgeladenen Datei-Inhalts).
+let baseline: Map<number, number> | null = null;
+let focusedAuthor: number | null = null;
+let coloringEnabled = true;
+
+export function captureBaseline(doc: Y.Doc) {
+  baseline = Y.decodeStateVector(Y.encodeStateVector(doc));
+  focusedAuthor = null;
+}
+
+export function clearBaseline() {
+  baseline = null;
+  focusedAuthor = null;
+}
+
+export const hasBaseline = () => baseline !== null;
+
+export function toggleColoring(): boolean {
+  coloringEnabled = !coloringEnabled;
+  return coloringEnabled;
+}
+export const isColoringEnabled = () => coloringEnabled;
+
+export function toggleFocus(clientId: number): number | null {
+  focusedAuthor = focusedAuthor === clientId ? null : clientId;
+  return focusedAuthor;
+}
+export const focusedAuthorId = () => focusedAuthor;
+
 export interface AuthorRun {
   client: number;
   from: number;
@@ -30,36 +70,61 @@ export interface AuthorRun {
 
 /**
  * Zeichen-Attribution aus der Yjs-Item-Kette: Jedes Zeichen gehört zu einem Item
- * mit der clientID seines Autors. Liest das interne `_start`-Feld (read-only;
- * stabil in yjs 13.x, per tools/test-author-runs.mjs gegen die echte Lib geprüft).
+ * mit der clientID seines Autors. Nutzt das `_start`-Feld (in den Yjs-Typen
+ * exponiert; per tools/test-author-runs.mjs gegen die echte Lib geerdet).
+ * Mit gesetzter Baseline wird Vor-Session-Bestand als NEUTRAL ausgewiesen.
+ * Achtung: Yjs verschmilzt benachbarte Items desselben Clients — ein Item kann
+ * die Baseline ÜBERSPANNEN und muss dann an der Baseline-Uhr geteilt werden
+ * (empirisch gefunden via tools/test-author-runs.mjs).
  */
 export function authorRuns(ytext: Y.Text): AuthorRun[] {
   const runs: AuthorRun[] = [];
   let pos = 0;
+
+  const push = (client: number, len: number) => {
+    const last = runs[runs.length - 1];
+    if (last && last.client === client && last.to === pos) {
+      last.to = pos + len;
+    } else {
+      runs.push({ client, from: pos, to: pos + len });
+    }
+    pos += len;
+  };
+
   let item: Y.Item | null = ytext._start;
   while (item !== null) {
     if (!item.deleted && item.countable) {
       const client = item.id.client;
       const len = item.length;
-      const last = runs[runs.length - 1];
-      if (last && last.client === client && last.to === pos) {
-        last.to = pos + len;
+      const blClock = baseline?.get(client) ?? 0;
+      if (baseline === null || item.id.clock >= blClock) {
+        push(client, len);
+      } else if (item.id.clock + len <= blClock) {
+        push(NEUTRAL, len);
       } else {
-        runs.push({ client, from: pos, to: pos + len });
+        // Item überspannt die Baseline: vorderen Teil neutral, Rest attribuieren
+        const neutralLen = blClock - item.id.clock;
+        push(NEUTRAL, neutralLen);
+        push(client, len - neutralLen);
       }
-      pos += len;
     }
     item = item.right;
   }
   return runs;
 }
 
-/**
- * CM6-Erweiterung: hinterlegt Text mit der Autorenfarbe. Erst aktiv, sobald
- * das Dokument Zeichen von mindestens zwei Autoren enthält (Solo-Tippen bleibt
- * unmarkiert). yCollab übersetzt auch Remote-Änderungen in CM-Transaktionen,
- * docChanged deckt daher beide Richtungen ab.
- */
+/** Sichtbarkeitsregel: mit Session-Baseline färben ab 1 Autor (Session aktiv),
+ * ohne Baseline erst ab 2 Autoren (Doc-Lebensdauer-Attribution). */
+export function coloringActive(runs: AuthorRun[]): boolean {
+  if (!coloringEnabled) return false;
+  const authors = new Set(
+    runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client),
+  );
+  return baseline !== null ? authors.size >= 1 : authors.size >= 2;
+}
+
+/** CM6-Erweiterung: hinterlegt Session-Text mit der Autorenfarbe; im Fokus-Modus
+ * wird ein Autor kräftig hervorgehoben und die übrigen treten zurück. */
 export function authorColoring(getYText: () => Y.Text) {
   return ViewPlugin.fromClass(
     class {
@@ -68,25 +133,29 @@ export function authorColoring(getYText: () => Y.Text) {
         this.decorations = this.build(view);
       }
       update(u: ViewUpdate) {
-        if (u.docChanged) this.decorations = this.build(u.view);
+        const refreshed = u.transactions.some((t) =>
+          t.effects.some((e) => e.is(authorsRefresh)),
+        );
+        if (u.docChanged || refreshed) this.decorations = this.build(u.view);
       }
       build(view: EditorView): DecorationSet {
         const runs = authorRuns(getYText());
-        const clients = new Set(runs.map((r) => r.client));
-        if (clients.size < 2) return Decoration.none;
+        if (!coloringActive(runs)) return Decoration.none;
         const docLen = view.state.doc.length;
         const marks = [];
         for (const r of runs) {
-          // Clamp: ytext und CM-Doc sind via yCollab synchron, aber bei
-          // gebatchten Remote-Updates defensiv gegen RangeErrors bleiben.
+          if (r.client === NEUTRAL) continue;
+          if (focusedAuthor !== null && r.client !== focusedAuthor) continue;
+          const pal = paletteFor(r.client);
+          const bg = focusedAuthor === r.client ? `${pal.color}55` : pal.light;
+          // Clamp: ytext und CM-Doc sind via yCollab synchron, defensiv gegen
+          // RangeErrors bei gebatchten Remote-Updates.
           const from = Math.min(r.from, docLen);
           const to = Math.min(r.to, docLen);
           if (to > from) {
             marks.push(
               Decoration.mark({
-                attributes: {
-                  style: `background-color: ${paletteFor(r.client).light}`,
-                },
+                attributes: { style: `background-color: ${bg}` },
                 class: "author-run",
               }).range(from, to),
             );

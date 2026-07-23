@@ -133,6 +133,22 @@ body,
   border-radius: 10px;
   font-size: 0.72rem;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.author-chip.focused {
+  font-weight: 700;
+  outline: 2px solid currentColor;
+}
+
+#btn-colors {
+  padding: 0.05rem 0.5rem;
+  border: 1px solid light-dark(#ccc, #444);
+  border-radius: 10px;
+  background: transparent;
+  color: light-dark(#777, #999);
+  font-size: 0.72rem;
+  cursor: pointer;
 }
 
 .error {
