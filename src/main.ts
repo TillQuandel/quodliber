@@ -121,6 +121,7 @@ const el = {
   statusMsg: document.querySelector<HTMLSpanElement>("#status-msg")!,
   legend: document.querySelector<HTMLSpanElement>("#author-legend")!,
   colorsToggle: document.querySelector<HTMLButtonElement>("#btn-colors")!,
+  roleInfo: document.querySelector<HTMLSpanElement>("#role-info")!,
   recoveryBanner: document.querySelector<HTMLDivElement>("#recovery-banner")!,
   recover: document.querySelector<HTMLButtonElement>("#btn-recover")!,
   recoverDismiss: document.querySelector<HTMLButtonElement>("#btn-recover-dismiss")!,
@@ -274,7 +275,24 @@ function updateSessionUi() {
   el.joinInput.disabled = !(mode === "idle" || answerPaste);
   el.joinInput.placeholder = answerPaste ? "Antwort-Code (QL1-…) einfügen" : "ip:port oder QL1-Code";
   el.open.disabled = mode === "joined";
+  el.open.title =
+    mode === "joined"
+      ? "Als Gast gesperrt — die geteilte Datei wählt der Host"
+      : "Textdatei öffnen" + (mode === "hosting" ? " (wird sofort in der Session geteilt)" : "");
   if (mode === "idle") el.sessionCode.textContent = "";
+  // Rechte-Transparenz: wer darf was — damit Gesperrtes nicht rätselhaft bleibt
+  if (mode === "hosting") {
+    el.roleInfo.textContent = "Rolle: Host";
+    el.roleInfo.title =
+      "Datei wählen ✓ · Original speichern ✓ · Gäste zulassen/ablehnen ✓";
+  } else if (mode === "joined") {
+    el.roleInfo.textContent = "Rolle: Gast";
+    el.roleInfo.title =
+      "Mittippen ✓ · Kopie speichern ✓ · Datei wählen ✗ (macht der Host) · Original speichern ✗";
+  } else {
+    el.roleInfo.textContent = "";
+    el.roleInfo.title = "";
+  }
   updateSaveButton();
   renderLanList();
 }
@@ -921,18 +939,39 @@ async function clearRecovery() {
   el.recoveryBanner.hidden = true;
 }
 
+let recoverArmed = false;
 el.recover.addEventListener("click", async () => {
   if (!recoveryPath) return;
-  if (mode !== "idle" || currentPath !== null || ytext.length > 0) {
-    status("Wiederherstellen nur in einem leeren Fenster möglich", true);
+  if (mode === "joined") {
+    status("Als Gast nicht möglich — erst Session verlassen", true);
+    return;
+  }
+  // Doppelklick-Schutz statt Blockade: bestehender Inhalt wird erst nach
+  // erneutem Klick ersetzt (kein stiller Verlust des offenen Dokuments)
+  if ((currentPath !== null || ytext.length > 0) && !recoverArmed) {
+    recoverArmed = true;
+    el.recover.textContent = "Wirklich ersetzen?";
+    status("Ersetzt den aktuellen Inhalt — zum Bestätigen erneut klicken", true);
     return;
   }
   try {
     const contents = await invoke<string>("read_file", { path: recoveryPath });
     resetDoc(contents);
+    currentPath = null;
     el.fileLabel.textContent = "(Wiederhergestellte Crash-Kopie — bitte speichern)";
     el.recoveryBanner.hidden = true;
-    status("Crash-Kopie wiederhergestellt");
+    recoverArmed = false;
+    el.recover.textContent = "Wiederherstellen";
+    if (mode === "hosting") {
+      // wie beim Datei-Wechsel: neue Baseline, Gäste schwenken via GUID um
+      wireDoc();
+      captureBaseline(ydoc);
+      refreshAuthorUi();
+      if (connected) sendHandshake();
+      status("Crash-Kopie wiederhergestellt — wird in der Session geteilt");
+    } else {
+      status("Crash-Kopie wiederhergestellt");
+    }
   } catch (e) {
     status(String(e), true);
   }

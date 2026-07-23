@@ -40,6 +40,11 @@ Entscheidungs-Historie: Projekt-Note „Echtzeit-Ko-Schreiben" im Vault.
 - **Verbindungs-Komfort:** Kompakt-Codes (eigenes Ticket-Format statt
   SDP-Base64), `quodliber://`-Klick-Links, Ein-Weg-Code + Host-Bestätigung
   bei erreichbarem Host (UPnP/IPv6)
+- **Berechtigungs-Optionen:** Host konfiguriert Gast-Rechte (z. B.
+  Nur-Lesen-Gäste, Gast darf Datei vorschlagen); Anzeige existiert bereits
+  (Rollen-Info in der Statusleiste). Hinweis: Nur-Lesen ist zunächst
+  UI-Durchsetzung (kooperatives Szenario), harte Durchsetzung bräuchte
+  Op-Filterung auf Host-Seite
 
 ## Später
 
