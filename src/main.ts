@@ -622,6 +622,26 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+// Einfüge-Automatik: QL1-Code irgendwo im Fenster einfügen (Strg+V) genügt —
+// die App erkennt ihn und tut das Richtige (beitreten bzw. Antwort verbinden).
+// Nicht im Editor abfangen: dort könnte man einen Code auch als TEXT einfügen wollen.
+window.addEventListener("paste", (e) => {
+  const target = e.target as HTMLElement | null;
+  if (target && el.editor.contains(target)) return;
+  const text = e.clipboardData?.getData("text")?.trim() ?? "";
+  if (!text.startsWith(CODE_PREFIX)) return;
+  e.preventDefault();
+  el.joinInput.value = text;
+  const canAct =
+    mode === "idle" || (mode === "hosting" && inetAwaitingAnswer);
+  if (canAct) {
+    status("Code erkannt — verbinde …");
+    void joinSession();
+  } else {
+    status("Code erkannt, aber aktuelle Session blockiert — erst beenden", true);
+  }
+});
+
 updateSessionUi();
 registerDocObservers();
 mountEditor();
