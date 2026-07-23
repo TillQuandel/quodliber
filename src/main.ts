@@ -126,11 +126,41 @@ function harvestAwarenessNames() {
 
 // Beobachter pro Doc-Inkarnation: Legende bei Text- und Namensänderungen nachziehen
 function registerDocObservers() {
-  ydoc.on("update", () => updateLegend());
+  ydoc.on("update", () => {
+    updateLegend();
+    scheduleAutosave();
+  });
   awareness.on("change", () => {
     harvestAwarenessNames();
     updateLegend();
   });
+}
+
+// --- Auto-Sichern: Host/Solo mit Pfad → in die Datei; Gast ohne Pfad → Crash-Kopie
+// im App-Datenordner (wird beim nächsten Start gemeldet).
+
+let recoveryPath: string | null = null;
+let autosaveTimer: number | undefined;
+
+function scheduleAutosave() {
+  clearTimeout(autosaveTimer);
+  autosaveTimer = window.setTimeout(() => void autosave(), 2000);
+}
+
+async function autosave() {
+  const text = ytext.toString();
+  try {
+    if (currentPath) {
+      await invoke("write_file", { path: currentPath, contents: text });
+      if (!el.statusMsg.textContent || el.statusMsg.textContent.startsWith("Auto")) {
+        status(`Auto-gespeichert ${new Date().toLocaleTimeString()}`);
+      }
+    } else if (recoveryPath && text.length > 0) {
+      await invoke("write_file", { path: recoveryPath, contents: text });
+    }
+  } catch {
+    // Autosave scheitert still — expliziter Strg+S-Pfad meldet Fehler sichtbar
+  }
 }
 
 function status(msg: string, isError = false) {
@@ -153,6 +183,7 @@ function updateSessionUi() {
   el.joinInput.disabled = mode !== "idle";
   el.open.disabled = mode !== "idle";
   if (mode === "idle") el.sessionCode.textContent = "";
+  updateSaveButton();
 }
 
 // --- Transport-Brücke: Bytes rein/raus über Tauri; der Kanal dahinter ist austauschbar
@@ -341,9 +372,17 @@ async function saveFile() {
     currentPath = path;
     el.fileLabel.textContent = path;
     status("Gespeichert");
+    updateSaveButton();
+    // Crash-Kopie ist ab jetzt überholt — leeren, damit kein stale Hinweis kommt
+    if (recoveryPath) void invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
   } catch (e) {
     status(String(e), true);
   }
+}
+
+// Gast ohne Pfad speichert eine lokale Kopie — Button-Beschriftung sagt das ehrlich
+function updateSaveButton() {
+  el.save.textContent = currentPath === null && mode === "joined" ? "Kopie speichern" : "Speichern";
 }
 
 // --- Session ---
@@ -484,3 +523,18 @@ window.addEventListener("keydown", (e) => {
 updateSessionUi();
 registerDocObservers();
 mountEditor();
+
+// Recovery-Pfad ermitteln + auf Crash-Kopie vom letzten Lauf hinweisen
+void invoke<string>("recovery_file_path")
+  .then(async (p) => {
+    recoveryPath = p;
+    try {
+      const leftover = await invoke<string>("read_file", { path: p });
+      if (leftover.trim().length > 0) {
+        status(`Crash-Kopie vom letzten Lauf vorhanden — über „Öffnen": ${p}`);
+      }
+    } catch {
+      // keine Crash-Kopie — Normalfall
+    }
+  })
+  .catch(() => {});
