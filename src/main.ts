@@ -346,7 +346,7 @@ function cancelRejoin() {
 function scheduleRejoin() {
   if (mode !== "joined" || !lastJoinedAddr || lastJoinedAddr.startsWith(CODE_PREFIX)) return;
   if (rejoinAttempt >= REJOIN_MAX) {
-    status("Automatische Wiederverbindung aufgegeben — „Erneut verbinden" versucht es manuell", true);
+    status("Automatische Wiederverbindung aufgegeben — »Erneut verbinden« versucht es manuell", true);
     return;
   }
   const delay = Math.min(2000 * 2 ** rejoinAttempt, 15000);
