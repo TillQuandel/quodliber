@@ -69,6 +69,9 @@ const el = {
   statusMsg: document.querySelector<HTMLSpanElement>("#status-msg")!,
   legend: document.querySelector<HTMLSpanElement>("#author-legend")!,
   colorsToggle: document.querySelector<HTMLButtonElement>("#btn-colors")!,
+  recoveryBanner: document.querySelector<HTMLDivElement>("#recovery-banner")!,
+  recover: document.querySelector<HTMLButtonElement>("#btn-recover")!,
+  recoverDismiss: document.querySelector<HTMLButtonElement>("#btn-recover-dismiss")!,
 };
 
 // Autoren-Register für die Legende: clientID → Name. Lebt pro Doc-Inkarnation;
@@ -524,15 +527,40 @@ updateSessionUi();
 registerDocObservers();
 mountEditor();
 
-// Recovery-Pfad ermitteln + auf Crash-Kopie vom letzten Lauf hinweisen
+// Recovery-Pfad ermitteln; bei vorhandener Crash-Kopie Banner mit
+// Wiederherstellen/Verwerfen zeigen (Realtest-Fund: Pfad-Suchen klappt nie)
+async function clearRecovery() {
+  if (recoveryPath) {
+    await invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
+  }
+  el.recoveryBanner.hidden = true;
+}
+
+el.recover.addEventListener("click", async () => {
+  if (!recoveryPath) return;
+  if (mode !== "idle" || currentPath !== null || ytext.length > 0) {
+    status("Wiederherstellen nur in einem leeren Fenster möglich", true);
+    return;
+  }
+  try {
+    const contents = await invoke<string>("read_file", { path: recoveryPath });
+    resetDoc(contents);
+    el.fileLabel.textContent = "(Wiederhergestellte Crash-Kopie — bitte speichern)";
+    el.recoveryBanner.hidden = true;
+    status("Crash-Kopie wiederhergestellt");
+  } catch (e) {
+    status(String(e), true);
+  }
+});
+
+el.recoverDismiss.addEventListener("click", () => void clearRecovery());
+
 void invoke<string>("recovery_file_path")
   .then(async (p) => {
     recoveryPath = p;
     try {
       const leftover = await invoke<string>("read_file", { path: p });
-      if (leftover.trim().length > 0) {
-        status(`Crash-Kopie vom letzten Lauf vorhanden — über „Öffnen": ${p}`);
-      }
+      if (leftover.trim().length > 0) el.recoveryBanner.hidden = false;
     } catch {
       // keine Crash-Kopie — Normalfall
     }

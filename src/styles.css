@@ -85,6 +85,29 @@ body,
   max-width: 40%;
 }
 
+#recovery-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.45rem 0.75rem;
+  font-size: 0.85rem;
+  background: light-dark(#fff7e0, #3a3320);
+  border-bottom: 1px solid light-dark(#e6c96b, #6b5d2a);
+}
+
+#recovery-banner[hidden] {
+  display: none;
+}
+
+#recovery-banner button {
+  padding: 0.2rem 0.7rem;
+  border: 1px solid light-dark(#c9ad4f, #8a7a3a);
+  border-radius: 6px;
+  background: light-dark(#fff, #2a2a2a);
+  color: inherit;
+  cursor: pointer;
+}
+
 #editor {
   flex: 1;
   overflow: hidden;
