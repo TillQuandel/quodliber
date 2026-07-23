@@ -20,21 +20,24 @@ Entscheidungs-Historie: Projekt-Note „Echtzeit-Ko-Schreiben" im Vault.
 
 ## Jetzt
 
-1. **Robustheit:** Heartbeat (Traffic-Überwachung) + Auto-Reconnect
-   (Gast: automatische Wiederverbindung mit Backoff; Host: automatisches
-   Re-Listen), sichtbarer Verbindungszustand
-2. **Tabs:** mehrere Dateien gleichzeitig offen; Session teilt weiterhin genau
-   eine Datei (Mehr-Datei-Sessions siehe „Später")
-3. **Mehr Dateitypen:** alle Textformate öffnen (txt/md/csv/json/…, Erkennung
-   binär vs. Text statt Endungs-Whitelist)
+*(2026-07-23 abgeschlossen und real getestet: Heartbeat + Auto-Reconnect,
+Tabs inkl. „⇄ Diesen Tab teilen", breite Dateityp-Filter, Rollen-/Rechte-
+Anzeige, „Gast trennen" mit Vertrauensentzug, ordnungsbasierte kollisions-
+freie Autorenfarben, Crash-Wiederherstellung mit Session-Fortsetzung,
+Geister-Session-Reset beim Start.)*
+
+1. **Remote-NAT-Realtest** (zwei echte Heimnetze, Peer 2) — der offene
+   Kernbeweis; entscheidet über UPnP-Booster/Transport-Härtung
 
 ## Als Nächstes
 
 - **M4 — Mehr-Peer-Sessions + Gruppenfeld:** Stern-Topologie über den Host
   (Peer-Kennung in der Byte-Brücke, Broadcast vs. gezielte Sync-Antworten),
   Beitritts-Bestätigung pro Gast, Teilnehmer-Panel aus der Awareness
-- **Remote-NAT-Realtest** (zwei echte Heimnetze) → entscheidet über
-  UPnP-Booster und die weitere Transport-Härtung
+- **Ansicht folgen** (optional): Gast folgt dem aktiven Tab des Hosts —
+  heute bewusst entkoppelt (geteilt wird ein Dokument, nicht die Ansicht)
+- **Kick-Politur:** eigene „Du wurdest getrennt"-Meldung (heute identisch
+  mit Beitritts-Ablehnung)
 - **E2E überall:** TCP/LAN-Pfad (heute Klartext) durch WebRTC mit
   mDNS-als-LAN-Signaling ersetzen → ein Transportpfad, alles DTLS
 - **Verbindungs-Komfort:** Kompakt-Codes (eigenes Ticket-Format statt
