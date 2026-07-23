@@ -140,6 +140,7 @@ const el = {
   lanList: document.querySelector<HTMLSpanElement>("#lan-list")!,
   tabbar: document.querySelector<HTMLDivElement>("#tabbar")!,
   newTab: document.querySelector<HTMLButtonElement>("#btn-new-tab")!,
+  shareTab: document.querySelector<HTMLButtonElement>("#btn-share-tab")!,
 };
 
 // Autoren-Register für die Legende: clientID → Name (lebt pro Session-Doc)
@@ -465,6 +466,7 @@ function updateSessionUi() {
       ? "Datei öffnen — ersetzt das geteilte Dokument für alle"
       : "Textdatei in neuem Tab öffnen";
   if (mode === "idle") el.sessionCode.textContent = "";
+  el.shareTab.hidden = !(mode === "hosting" && active !== sessionTab);
   if (mode === "hosting") {
     el.roleInfo.textContent = "Rolle: Host";
     el.roleInfo.title = "Geteilte Datei wählen ✓ · Original speichern ✓ · Gäste zulassen/ablehnen ✓ · eigene Tabs ✓";
@@ -575,7 +577,12 @@ function handleIncoming(data: Uint8Array) {
   } else if (type === MSG_PING) {
     return;
   } else if (type === MSG_HELLO) {
-    if (mode !== "hosting") return;
+    if (mode !== "hosting") {
+      // Kein stummes Verwerfen: der Anklopfende bekommt eine klare Ablehnung
+      // (z. B. Geister-Listener nach Frontend-Reload)
+      sendControl(MSG_REJECT, null);
+      return;
+    }
     let hello: { id?: string; name?: string };
     try {
       hello = JSON.parse(decoding.readVarString(dec)) as { id?: string; name?: string };
@@ -986,6 +993,19 @@ el.host.addEventListener("click", hostSession);
 el.inet.addEventListener("click", hostInternet);
 el.join.addEventListener("click", joinSession);
 el.newTab.addEventListener("click", () => switchTab(createTab("", null)));
+el.shareTab.addEventListener("click", () => {
+  if (mode !== "hosting" || active === sessionTab) return;
+  // On-the-fly-Wechsel des geteilten Dokuments: Zeiger umsetzen + Handshake —
+  // der Gast erkennt die neue Doc-GUID (MSG_META) und adoptiert frisch
+  sessionTab = active;
+  authorNames.clear();
+  captureBaseline(sessionTab.ydoc);
+  refreshAuthorUi();
+  if (connected && authorized) sendHandshake();
+  updateSessionUi();
+  updateFileLabel();
+  status("Dieser Tab wird jetzt geteilt");
+});
 el.sessionCode.addEventListener("click", () => {
   const code = el.sessionCode.textContent;
   if (code) copyCode(code, "Code");
@@ -1090,6 +1110,9 @@ updateFileLabel();
 updateSessionUi();
 mountEditor();
 
+// Frisches Frontend = frische Session: räumt Rust-Geisterzustand ab
+// (Listener/Verbindungen überleben WebView-Reloads, der Frontend-State nicht)
+void invoke("leave_session").catch(() => {});
 void invoke("lan_init").catch(() => {});
 
 void invoke<string>("recovery_file_path")
