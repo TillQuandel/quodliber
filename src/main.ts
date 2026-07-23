@@ -37,7 +37,12 @@ const MSG_META = 2;
 const MSG_HELLO = 3;
 const MSG_WELCOME = 4;
 const MSG_REJECT = 5;
+// Heartbeat: beide Seiten pingen; jeder Empfang zählt als Lebenszeichen —
+// bleibt der Kanal >15 s stumm, gilt er als eingeschlafen (Half-Open-TCP etc.)
+const MSG_PING = 6;
 const SESSION_PORT = 41420;
+const PING_MS = 5000;
+const STALE_MS = 15000;
 
 // Persistente Install-Identität (v0: zufällige ID, keine Kryptografie —
 // spoofbar, fürs LAN-/Bekannten-Szenario akzeptiert; echte Schlüssel später)
@@ -91,6 +96,15 @@ let guestBaselinePending = false;
 // Internet-Session (Host): Offer verschickt, Antwort-Code ausstehend
 let inetAwaitingAnswer = false;
 const CODE_PREFIX = "QL1-";
+// Transport der aktiven Host-Session (Auto-Rehost geht nur bei TCP)
+let hostTransport: "tcp" | "inet" | null = null;
+// Heartbeat + Auto-Reconnect
+let lastRecv = 0;
+let pingTimer: number | undefined;
+let watchdogTimer: number | undefined;
+let rejoinTimer: number | undefined;
+let rejoinAttempt = 0;
+const REJOIN_MAX = 6;
 
 const el = {
   open: document.querySelector<HTMLButtonElement>("#btn-open")!,
@@ -301,6 +315,68 @@ function currentName(): string {
   return el.nameInput.value.trim() || `Autor-${ydoc.clientID % 1000}`;
 }
 
+// --- Heartbeat + Auto-Reconnect ---
+
+function startHeartbeat() {
+  stopHeartbeat();
+  lastRecv = Date.now();
+  pingTimer = window.setInterval(() => {
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MSG_PING);
+    rawSend(encoding.toUint8Array(enc));
+  }, PING_MS);
+  watchdogTimer = window.setInterval(() => {
+    if (connected && Date.now() - lastRecv > STALE_MS) handleStale();
+  }, 3000);
+}
+
+function stopHeartbeat() {
+  clearInterval(pingTimer);
+  clearInterval(watchdogTimer);
+}
+
+function cancelRejoin() {
+  clearTimeout(rejoinTimer);
+  rejoinAttempt = 0;
+}
+
+// Gast (TCP): automatische Wiederverbindung mit Backoff — der verlustfreie
+// Merge übernimmt danach (geteilte Historie). Internet-Codes sind Einmal-
+// Material, dort gibt es keinen Auto-Rejoin.
+function scheduleRejoin() {
+  if (mode !== "joined" || !lastJoinedAddr || lastJoinedAddr.startsWith(CODE_PREFIX)) return;
+  if (rejoinAttempt >= REJOIN_MAX) {
+    status("Automatische Wiederverbindung aufgegeben — „Erneut verbinden" versucht es manuell", true);
+    return;
+  }
+  const delay = Math.min(2000 * 2 ** rejoinAttempt, 15000);
+  rejoinAttempt++;
+  connStatus(`getrennt — neuer Versuch in ${Math.round(delay / 1000)} s (${rejoinAttempt}/${REJOIN_MAX})`);
+  rejoinTimer = window.setTimeout(() => {
+    if (mode === "joined" && !connected) void joinSession();
+  }, delay);
+}
+
+function handleStale() {
+  connected = false;
+  authorized = false;
+  stopHeartbeat();
+  clearRemoteAwareness();
+  status("Verbindung eingeschlafen — stelle neu her …", true);
+  if (mode === "joined") {
+    void invoke("leave_session").catch(() => {});
+    scheduleRejoin();
+  } else if (mode === "hosting" && hostTransport === "tcp") {
+    // Re-Host räumt den toten Peer ab und lauscht wieder (inkl. mDNS-Ansage)
+    void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId })
+      .then(() => connStatus("wartet auf Peer …"))
+      .catch((e) => status(String(e), true));
+  } else if (mode === "hosting") {
+    connStatus("Internet-Session tot — neuen Code erzeugen");
+  }
+  updateSessionUi();
+}
+
 function sendHandshake() {
   if (mode === "hosting") {
     const encMeta = encoding.createEncoder();
@@ -402,6 +478,8 @@ function handleIncoming(data: Uint8Array) {
     if (mode !== "joined") return;
     status("Der Host hat den Beitritt abgelehnt", true);
     void leaveSession();
+  } else if (type === MSG_PING) {
+    return; // Empfang selbst ist das Lebenszeichen (lastRecv im Listener)
   } else if (type === MSG_META) {
     const guid = decoding.readVarString(dec);
     if (mode !== "joined") return;
@@ -477,7 +555,13 @@ async function openFile() {
   }
   const path = await open({
     multiple: false,
-    filters: [{ name: "Markdown", extensions: ["md", "markdown", "txt"] }],
+    filters: [
+      {
+        name: "Textdateien",
+        extensions: ["md", "markdown", "txt", "csv", "json", "yaml", "yml", "tex", "html", "css", "js", "ts", "py", "rs", "toml", "ini", "log"],
+      },
+      { name: "Alle Dateien", extensions: ["*"] },
+    ],
   });
   if (typeof path !== "string") return;
   try {
@@ -495,7 +579,10 @@ async function saveFile() {
   let path = currentPath;
   if (!path) {
     const chosen = await save({
-      filters: [{ name: "Markdown", extensions: ["md"] }],
+      filters: [
+        { name: "Markdown", extensions: ["md"] },
+        { name: "Alle Dateien", extensions: ["*"] },
+      ],
     });
     if (typeof chosen !== "string") return;
     path = chosen;
@@ -533,6 +620,7 @@ async function hostSession() {
       id: myId,
     });
     mode = "hosting";
+    hostTransport = "tcp";
     wireDoc();
     // Session-Baseline: der vorgeladene Datei-Inhalt ist Bestand, kein Autoren-Text
     captureBaseline(ydoc);
@@ -651,6 +739,9 @@ async function leaveSession() {
   authorized = false;
   pendingHello = null;
   el.joinBanner.hidden = true;
+  stopHeartbeat();
+  cancelRejoin();
+  hostTransport = null;
   hostGuid = null;
   lastJoinedAddr = null;
   guestBaselinePending = false;
@@ -666,6 +757,7 @@ async function leaveSession() {
 // --- Events vom Backend ---
 
 void listen<number[]>("net-recv", (e) => {
+  lastRecv = Date.now();
   handleIncoming(Uint8Array.from(e.payload));
 });
 
@@ -687,6 +779,8 @@ void listen<string>("net-status", (e) => {
     connected = true;
     authorized = false;
     inetAwaitingAnswer = false;
+    cancelRejoin();
+    startHeartbeat();
     updateSessionUi();
     if (mode === "joined") {
       connStatus("warte auf Bestätigung des Hosts …");
@@ -702,12 +796,13 @@ void listen<string>("net-status", (e) => {
     authorized = false;
     pendingHello = null;
     el.joinBanner.hidden = true;
+    stopHeartbeat();
     clearRemoteAwareness();
     if (mode === "hosting") {
       connStatus("wartet auf Peer …");
     } else if (mode === "joined") {
-      connStatus("getrennt");
-      status("Verbindung verloren — „Erneut verbinden“ merged deine Änderungen", true);
+      status("Verbindung verloren — automatische Wiederverbindung läuft", true);
+      scheduleRejoin();
     }
     updateSessionUi();
   } else if (s === "offline") {
@@ -728,6 +823,7 @@ async function hostInternet() {
     status("Erzeuge Internet-Code … (STUN-Abfrage, wenige Sekunden)");
     const code = await invoke<string>("webrtc_offer");
     mode = "hosting";
+    hostTransport = "inet";
     inetAwaitingAnswer = true;
     wireDoc();
     captureBaseline(ydoc);
