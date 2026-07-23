@@ -32,3 +32,28 @@ node tools\robo-peer.mjs [ip:port] # Protokoll-Zweitclient für Gleichzeitigkeit
 
 Stack: Tauri v2 (Rust) · CodeMirror 6 + Yjs (TypeScript) · webrtc-rs · mdns-sd.
 Lizenzkette vollständig MIT/Apache-kompatibel.
+
+## Sicherheit & Lieferkette
+
+Selbst nachprüfbar mit zwei Kommandos (Stand 2026-07-23: beide ohne Funde):
+
+```powershell
+npm audit                      # CVE-Abgleich Frontend (49 Pakete gesamt)
+cargo audit                    # RustSec-Abgleich Backend (510 Kisten gesamt)
+```
+
+- **Lockfiles committet** (`package-lock.json`, `Cargo.lock`) — Installationen
+  sind bit-genau reproduzierbar; npm/crates.io-Versionen sind unveränderlich.
+- **Kein Framework, keine CDN-Ressourcen:** Frontend = 49 npm-Pakete, alles
+  gebündelt; strikte CSP im Release (keine externen Quellen).
+- **Netzwerkverhalten:** Internet-Sessions sind DTLS-E2E-verschlüsselt; einzige
+  Fremd-Infrastruktur sind zustandslose STUN-Server (sehen nie Inhalte).
+  LAN/TCP-Pfad ist derzeit unverschlüsselt (siehe ROADMAP → E2E überall).
+- **Ehrliche Restrisiken:** Yjs- und CodeMirror-Ökosysteme sind
+  Ein-Personen-Projekte (enorme Verbreitung, aber Single-Maintainer-
+  Lieferkette); die Rust-Kette ist groß (webrtc/tauri); cargo-audit meldet
+  in transitiven Kisten 2× „unmaintained" (unic-ucd-*) und 1× Unsoundness
+  (`glib`, nur Linux-Build — im Windows-Binary nicht enthalten).
+- Ausbaustufen (ROADMAP): `cargo deny` in CI, `cargo vet`
+  (geteilte Audit-Datenbank), npm-Provenance, Code-Signing.
+
