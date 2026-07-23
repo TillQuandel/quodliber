@@ -77,7 +77,8 @@ export interface AuthorRun {
  * die Baseline ÜBERSPANNEN und muss dann an der Baseline-Uhr geteilt werden
  * (empirisch gefunden via tools/test-author-runs.mjs).
  */
-export function authorRuns(ytext: Y.Text): AuthorRun[] {
+export function authorRuns(ytext: Y.Text, useBaseline = true): AuthorRun[] {
+  const bl = useBaseline ? baseline : null;
   const runs: AuthorRun[] = [];
   let pos = 0;
 
@@ -96,8 +97,8 @@ export function authorRuns(ytext: Y.Text): AuthorRun[] {
     if (!item.deleted && item.countable) {
       const client = item.id.client;
       const len = item.length;
-      const blClock = baseline?.get(client) ?? 0;
-      if (baseline === null || item.id.clock >= blClock) {
+      const blClock = bl?.get(client) ?? 0;
+      if (bl === null || item.id.clock >= blClock) {
         push(client, len);
       } else if (item.id.clock + len <= blClock) {
         push(NEUTRAL, len);
@@ -113,19 +114,21 @@ export function authorRuns(ytext: Y.Text): AuthorRun[] {
   return runs;
 }
 
-/** Sichtbarkeitsregel: mit Session-Baseline färben ab 1 Autor (Session aktiv),
- * ohne Baseline erst ab 2 Autoren (Doc-Lebensdauer-Attribution). */
-export function coloringActive(runs: AuthorRun[]): boolean {
+/** Sichtbarkeitsregel: mit angewandter Session-Baseline färben ab 1 Autor
+ * (Session-Tab), sonst erst ab 2 Autoren (Doc-Lebensdauer-Attribution).
+ * `baselineApplied` MUSS dem useBaseline-Wert des authorRuns-Aufrufs entsprechen —
+ * die globale Baseline gilt nur für den Session-Tab, nicht für fremde Tabs. */
+export function coloringActive(runs: AuthorRun[], baselineApplied: boolean): boolean {
   if (!coloringEnabled) return false;
   const authors = new Set(
     runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client),
   );
-  return baseline !== null ? authors.size >= 1 : authors.size >= 2;
+  return baselineApplied && baseline !== null ? authors.size >= 1 : authors.size >= 2;
 }
 
 /** CM6-Erweiterung: hinterlegt Session-Text mit der Autorenfarbe; im Fokus-Modus
  * wird ein Autor kräftig hervorgehoben und die übrigen treten zurück. */
-export function authorColoring(getYText: () => Y.Text) {
+export function authorColoring(getYText: () => Y.Text, isSessionTab: () => boolean) {
   return ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
@@ -139,8 +142,9 @@ export function authorColoring(getYText: () => Y.Text) {
         if (u.docChanged || refreshed) this.decorations = this.build(u.view);
       }
       build(view: EditorView): DecorationSet {
-        const runs = authorRuns(getYText());
-        if (!coloringActive(runs)) return Decoration.none;
+        const inSession = isSessionTab();
+        const runs = authorRuns(getYText(), inSession);
+        if (!coloringActive(runs, inSession)) return Decoration.none;
         const docLen = view.state.doc.length;
         const marks = [];
         for (const r of runs) {

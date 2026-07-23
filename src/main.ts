@@ -80,6 +80,7 @@ function rememberPeer(id: string, name: string) {
 interface Tab {
   id: number;
   path: string | null;
+  label: string | null; // Anzeige-Override (z. B. "(Wiederhergestellt)")
   ydoc: Y.Doc;
   ytext: Y.Text;
   awareness: Awareness;
@@ -177,6 +178,7 @@ function tabLabel(tab: Tab): string {
     return parts[parts.length - 1] || tab.path;
   }
   if (tab === sessionTab && mode === "joined") return "(Session)";
+  if (tab.label) return tab.label;
   return `Neu ${tab.id}`;
 }
 
@@ -247,6 +249,7 @@ function createTab(contents: string, path: string | null): Tab {
   const tab: Tab = {
     id: nextTabId++,
     path,
+    label: null,
     ydoc,
     ytext,
     awareness: new Awareness(ydoc),
@@ -282,12 +285,19 @@ function replaceDoc(tab: Tab, contents: string) {
 
 function switchTab(tab: Tab) {
   if (tab === active) return;
-  active = tab;
-  mountEditor();
-  updateFileLabel();
-  updateTabBar();
-  updateLegend();
-  updateSessionUi();
+  // Instrumentiert: ein Fehler beim Wechsel darf nie still verschluckt werden
+  // (Realtest-Befund „Tabs in der Session nicht wechselbar" — Ursachensuche)
+  try {
+    active = tab;
+    mountEditor();
+    updateFileLabel();
+    updateTabBar();
+    updateLegend();
+    updateSessionUi();
+  } catch (e) {
+    status(`Tab-Wechsel-Fehler: ${String(e)}`, true);
+    console.error("switchTab", e);
+  }
 }
 
 function closeTab(tab: Tab) {
@@ -306,6 +316,12 @@ function closeTab(tab: Tab) {
     }, 4000);
     return;
   }
+  // Letzter leerer Tab: Schließen wäre ein No-Op mit hochzählendem "Neu N" —
+  // gar nichts tun (Realtest-Fund Till)
+  if (tabs.length === 1 && tab.path === null && tab.ytext.length === 0) {
+    status("");
+    return;
+  }
   tab.awareness.destroy();
   tab.ydoc.destroy();
   clearTimeout(tab.autosaveTimer);
@@ -313,6 +329,7 @@ function closeTab(tab: Tab) {
   tabs.splice(idx, 1);
   if (tab === sessionTab) sessionTab = null;
   if (tabs.length === 0) {
+    nextTabId = 1;
     active = createTab("", null);
   } else if (tab === active) {
     active = tabs[Math.max(0, idx - 1)];
@@ -343,7 +360,10 @@ function mountEditor() {
       markdown(),
       EditorView.lineWrapping,
       yCollab(tab.ytext, tab.awareness, { undoManager: tab.undoManager }),
-      authorColoring(() => tab.ytext),
+      authorColoring(
+        () => tab.ytext,
+        () => tab === sessionTab,
+      ),
     ],
   });
   view = new EditorView({ state, parent: el.editor });
@@ -358,8 +378,9 @@ function refreshAuthorUi() {
 
 function updateLegend() {
   el.legend.innerHTML = "";
-  const runs = authorRuns(active.ytext);
-  if (!coloringActive(runs)) return;
+  const inSession = active === sessionTab;
+  const runs = authorRuns(active.ytext, inSession);
+  if (!coloringActive(runs, inSession)) return;
   const clients = new Set(runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client));
   for (const id of clients) {
     const chip = document.createElement("span");
@@ -1014,8 +1035,13 @@ el.recover.addEventListener("click", async () => {
       status("Crash-Kopie wiederhergestellt — wird in der Session geteilt");
     } else {
       const tab = createTab(contents, null);
+      tab.label = "(Wiederhergestellt)";
       switchTab(tab);
-      if (mode === "idle") {
+      if (mode === "idle" && lanHosts.size > 0) {
+        // Vermutlich Gast nach Absturz: der Host ist noch im LAN sichtbar —
+        // Wiederbeitritt holt den Live-Stand, die Kopie bleibt als Sicherung
+        status("Kopie wiederhergestellt — Host ist im LAN sichtbar: Chip klicken zum Wiederbeitreten");
+      } else if (mode === "idle") {
         await hostSession();
         status("Crash-Kopie wiederhergestellt — Session läuft, Gäste können beitreten");
       } else {
