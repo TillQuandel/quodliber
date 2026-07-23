@@ -970,7 +970,9 @@ el.recover.addEventListener("click", async () => {
       if (connected) sendHandshake();
       status("Crash-Kopie wiederhergestellt — wird in der Session geteilt");
     } else {
-      status("Crash-Kopie wiederhergestellt");
+      // Wiederherstellen heißt „weitermachen": direkt wieder als Host anbieten
+      await hostSession();
+      status("Crash-Kopie wiederhergestellt — Session läuft, Gäste können beitreten");
     }
   } catch (e) {
     status(String(e), true);
