@@ -141,7 +141,17 @@ const el = {
   tabbar: document.querySelector<HTMLDivElement>("#tabbar")!,
   newTab: document.querySelector<HTMLButtonElement>("#btn-new-tab")!,
   shareTab: document.querySelector<HTMLButtonElement>("#btn-share-tab")!,
+  kick: document.querySelector<HTMLButtonElement>("#btn-kick")!,
 };
+
+// Aktuell verbundener Gast (Host-Sicht) — für Kick + Vertrauensentzug
+let currentPeer: { id: string; name: string } | null = null;
+
+function forgetPeer(id: string) {
+  const k = knownPeers();
+  delete k[id];
+  localStorage.setItem(KNOWN_KEY, JSON.stringify(k));
+}
 
 // Autoren-Register für die Legende: clientID → Name (lebt pro Session-Doc)
 const authorNames = new Map<number, string>();
@@ -467,6 +477,7 @@ function updateSessionUi() {
       : "Textdatei in neuem Tab öffnen";
   if (mode === "idle") el.sessionCode.textContent = "";
   el.shareTab.hidden = !(mode === "hosting" && active !== sessionTab);
+  el.kick.hidden = !(mode === "hosting" && connected && authorized);
   if (mode === "hosting") {
     el.roleInfo.textContent = "Rolle: Host";
     el.roleInfo.title = "Geteilte Datei wählen ✓ · Original speichern ✓ · Gäste zulassen/ablehnen ✓ · eigene Tabs ✓";
@@ -541,6 +552,7 @@ function sendHandshake() {
 
 function acceptPeer(peer: { id: string; name: string }) {
   if (peer.id) rememberPeer(peer.id, peer.name);
+  currentPeer = peer;
   pendingHello = null;
   el.joinBanner.hidden = true;
   authorized = true;
@@ -969,6 +981,7 @@ void listen<string>("net-status", (e) => {
     connected = false;
     authorized = false;
     pendingHello = null;
+    currentPeer = null;
     el.joinBanner.hidden = true;
     stopHeartbeat();
     clearRemoteAwareness();
@@ -1031,6 +1044,23 @@ el.jrAccept.addEventListener("click", () => {
   if (pendingHello) acceptPeer(pendingHello);
 });
 el.jrReject.addEventListener("click", rejectPeer);
+el.kick.addEventListener("click", () => {
+  if (mode !== "hosting" || !connected) return;
+  const name = currentPeer?.name ?? "Gast";
+  if (currentPeer?.id) forgetPeer(currentPeer.id);
+  currentPeer = null;
+  sendControl(MSG_REJECT, null);
+  authorized = false;
+  status(`${name} getrennt — beim nächsten Beitritt ist wieder deine Bestätigung nötig`);
+  updateSessionUi();
+  // Gast verlässt auf REJECT selbst; falls nicht (Fremd-Client), nach 2 s
+  // die Verbindung host-seitig kappen und weiterlauschen
+  window.setTimeout(() => {
+    if (connected && mode === "hosting" && hostTransport === "tcp") {
+      void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId }).catch(() => {});
+    }
+  }, 2000);
+});
 
 let recoverArmed = false;
 el.recover.addEventListener("click", async () => {
