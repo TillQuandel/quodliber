@@ -273,7 +273,7 @@ function updateSessionUi() {
   el.join.disabled = (mode === "hosting" && !answerPaste) || (mode === "joined" && connected);
   el.joinInput.disabled = !(mode === "idle" || answerPaste);
   el.joinInput.placeholder = answerPaste ? "Antwort-Code (QL1-…) einfügen" : "ip:port oder QL1-Code";
-  el.open.disabled = mode !== "idle";
+  el.open.disabled = mode === "joined";
   if (mode === "idle") el.sessionCode.textContent = "";
   updateSaveButton();
   renderLanList();
@@ -549,8 +549,8 @@ function resetDoc(contents: string) {
 // --- Datei ---
 
 async function openFile() {
-  if (mode !== "idle") {
-    status("Während einer Session nicht möglich — erst Session beenden", true);
+  if (mode === "joined") {
+    status("Als Gast nicht möglich — die Datei wählt der Host", true);
     return;
   }
   const path = await open({
@@ -569,7 +569,17 @@ async function openFile() {
     resetDoc(contents);
     currentPath = path;
     el.fileLabel.textContent = path;
-    status("Geöffnet");
+    if (mode === "hosting") {
+      // Host wechselt die geteilte Datei mitten in der Session: neue Baseline,
+      // Gäste schwenken über den Doc-GUID-Handshake (MSG_META) automatisch um
+      wireDoc();
+      captureBaseline(ydoc);
+      refreshAuthorUi();
+      if (connected) sendHandshake();
+      status("Geöffnet — wird in der Session geteilt");
+    } else {
+      status("Geöffnet");
+    }
   } catch (e) {
     status(String(e), true);
   }
@@ -708,9 +718,14 @@ async function joinSession() {
     await invoke("join_session", { addr });
     lastJoinedAddr = addr;
   } catch (e) {
-    if (!rejoin) mode = "idle";
+    if (!rejoin) {
+      mode = "idle";
+      status(String(e), true);
+    } else {
+      // Fehlversuch in der Auto-Reconnect-Kette: nächsten Versuch einplanen
+      scheduleRejoin();
+    }
     updateSessionUi();
-    status(String(e), true);
   }
 }
 
@@ -846,9 +861,14 @@ el.colorsToggle.addEventListener("click", () => {
   el.colorsToggle.textContent = on ? "Farben aus" : "Farben an";
   refreshAuthorUi();
 });
-el.nameInput.value = localStorage.getItem(NAME_STORAGE_KEY) ?? "";
+// Name fensterlokal (sessionStorage) — der geteilte localStorage dient nur als
+// Vorbelegung, sonst überschreiben sich zwei Fenster auf einem Rechner gegenseitig
+el.nameInput.value =
+  sessionStorage.getItem(NAME_STORAGE_KEY) ?? localStorage.getItem(NAME_STORAGE_KEY) ?? "";
 el.nameInput.addEventListener("change", () => {
-  localStorage.setItem(NAME_STORAGE_KEY, el.nameInput.value.trim());
+  const v = el.nameInput.value.trim();
+  sessionStorage.setItem(NAME_STORAGE_KEY, v);
+  localStorage.setItem(NAME_STORAGE_KEY, v);
   awareness.setLocalStateField("user", localUser());
   updateLegend();
 });
