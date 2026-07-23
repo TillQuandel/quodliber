@@ -13,6 +13,7 @@
         <div class="group">
           <button id="btn-open" title="Markdown-Datei öffnen">Öffnen</button>
           <button id="btn-save" title="Speichern (Strg+S)">Speichern</button>
+          <input id="name-input" placeholder="Dein Name" title="Autoren-Name (leer = automatisch)" spellcheck="false" maxlength="24" />
         </div>
         <div class="group">
           <button id="btn-host" title="Als Host lauschen (LAN/M2)">Session starten</button>
@@ -25,6 +26,7 @@
       <main id="editor"></main>
       <footer id="statusbar">
         <span id="status-conn" class="muted">offline</span>
+        <span id="author-legend"></span>
         <span id="status-msg" class="muted"></span>
       </footer>
     </div>

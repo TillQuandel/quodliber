@@ -111,6 +111,30 @@ body,
   color: light-dark(#777, #999);
 }
 
+#name-input {
+  width: 8rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid light-dark(#ccc, #444);
+  border-radius: 6px;
+  background: light-dark(#fff, #1e1e1e);
+  color: inherit;
+  font-size: 0.85rem;
+}
+
+#author-legend {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.author-chip {
+  padding: 0.05rem 0.45rem;
+  border: 1px solid;
+  border-radius: 10px;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .error {
   color: light-dark(#c0392b, #e74c3c);
 }

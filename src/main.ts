@@ -12,6 +12,7 @@ import * as syncProtocol from "y-protocols/sync";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
+import { authorColoring, authorRuns, paletteFor } from "./author-colors";
 
 // Nachrichten-Envelope wie bei y-websocket: [Typ-VarUint][Payload]
 const MSG_SYNC = 0;
@@ -46,21 +47,64 @@ const el = {
   host: document.querySelector<HTMLButtonElement>("#btn-host")!,
   join: document.querySelector<HTMLButtonElement>("#btn-join")!,
   joinInput: document.querySelector<HTMLInputElement>("#join-input")!,
+  nameInput: document.querySelector<HTMLInputElement>("#name-input")!,
   sessionCode: document.querySelector<HTMLSpanElement>("#session-code")!,
   fileLabel: document.querySelector<HTMLDivElement>("#file-label")!,
   editor: document.querySelector<HTMLElement>("#editor")!,
   statusConn: document.querySelector<HTMLSpanElement>("#status-conn")!,
   statusMsg: document.querySelector<HTMLSpanElement>("#status-msg")!,
+  legend: document.querySelector<HTMLSpanElement>("#author-legend")!,
 };
 
-const USER_COLORS = [
-  { color: "#30bced", light: "#30bced33" },
-  { color: "#ee6352", light: "#ee635233" },
-];
+// Autoren-Register für die Legende: clientID → Name. Lebt pro Doc-Inkarnation;
+// Namen kommen aus der Awareness (verbundene Peers) bzw. dem eigenen Namensfeld.
+const authorNames = new Map<number, string>();
+
+const NAME_STORAGE_KEY = "quodliber-name";
+
+function authorName(clientId: number): string {
+  return authorNames.get(clientId) ?? `Autor-${clientId % 1000}`;
+}
 
 function localUser() {
-  const idx = Math.floor(Math.random() * USER_COLORS.length);
-  return { name: `Nutzer-${ydoc.clientID % 1000}`, ...USER_COLORS[idx] };
+  const custom = el.nameInput.value.trim();
+  const name = custom || `Autor-${ydoc.clientID % 1000}`;
+  const pal = paletteFor(ydoc.clientID);
+  authorNames.set(ydoc.clientID, name);
+  return { name, color: pal.color, colorLight: pal.light };
+}
+
+function updateLegend() {
+  const clients = new Set(authorRuns(ytext).map((r) => r.client));
+  if (clients.size < 2) {
+    el.legend.innerHTML = "";
+    return;
+  }
+  el.legend.innerHTML = "";
+  for (const id of clients) {
+    const chip = document.createElement("span");
+    chip.className = "author-chip";
+    chip.style.backgroundColor = paletteFor(id).light;
+    chip.style.borderColor = paletteFor(id).color;
+    chip.textContent = authorName(id);
+    el.legend.appendChild(chip);
+  }
+}
+
+function harvestAwarenessNames() {
+  for (const [id, state] of awareness.getStates()) {
+    const name = (state as { user?: { name?: string } }).user?.name;
+    if (name) authorNames.set(id, name);
+  }
+}
+
+// Beobachter pro Doc-Inkarnation: Legende bei Text- und Namensänderungen nachziehen
+function registerDocObservers() {
+  ydoc.on("update", () => updateLegend());
+  awareness.on("change", () => {
+    harvestAwarenessNames();
+    updateLegend();
+  });
 }
 
 function status(msg: string, isError = false) {
@@ -199,6 +243,7 @@ function mountEditor() {
       markdown(),
       EditorView.lineWrapping,
       yCollab(ytext, awareness, { undoManager }),
+      authorColoring(() => ytext),
     ],
   });
   view = new EditorView({ state, parent: el.editor });
@@ -210,12 +255,15 @@ function resetDoc(contents: string) {
   awareness.destroy();
   ydoc.destroy();
   wiredFor = null;
+  authorNames.clear();
   ydoc = new Y.Doc();
   ytext = ydoc.getText("content");
   if (contents.length > 0) ytext.insert(0, contents);
   awareness = new Awareness(ydoc);
   undoManager = new Y.UndoManager(ytext);
+  registerDocObservers();
   mountEditor();
+  updateLegend();
 }
 
 // --- Datei ---
@@ -361,6 +409,12 @@ el.open.addEventListener("click", openFile);
 el.save.addEventListener("click", saveFile);
 el.host.addEventListener("click", hostSession);
 el.join.addEventListener("click", joinSession);
+el.nameInput.value = localStorage.getItem(NAME_STORAGE_KEY) ?? "";
+el.nameInput.addEventListener("change", () => {
+  localStorage.setItem(NAME_STORAGE_KEY, el.nameInput.value.trim());
+  awareness.setLocalStateField("user", localUser());
+  updateLegend();
+});
 el.sessionCode.addEventListener("click", () => {
   const code = el.sessionCode.textContent;
   if (code) {
@@ -378,4 +432,5 @@ window.addEventListener("keydown", (e) => {
 });
 
 updateSessionUi();
+registerDocObservers();
 mountEditor();
