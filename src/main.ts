@@ -32,7 +32,38 @@ const MSG_AWARENESS = 1;
 // Doc-GUID-Ansage: erkennt beim Re-Join, ob der Host inzwischen ein anderes
 // Dokument teilt (dann muss der Gast neu adoptieren statt zu mergen)
 const MSG_META = 2;
+// Beitritts-Handshake: Gast stellt sich vor (HELLO), Host bestätigt (WELCOME)
+// oder lehnt ab (REJECT). Vor WELCOME fließt kein Dokument-Inhalt (TOFU-Muster).
+const MSG_HELLO = 3;
+const MSG_WELCOME = 4;
+const MSG_REJECT = 5;
 const SESSION_PORT = 41420;
+
+// Persistente Install-Identität (v0: zufällige ID, keine Kryptografie —
+// spoofbar, fürs LAN-/Bekannten-Szenario akzeptiert; echte Schlüssel später)
+const IDENTITY_KEY = "quodliber-id";
+const KNOWN_KEY = "quodliber-known-peers";
+const myId = (() => {
+  let v = localStorage.getItem(IDENTITY_KEY);
+  if (!v) {
+    v = crypto.randomUUID();
+    localStorage.setItem(IDENTITY_KEY, v);
+  }
+  return v;
+})();
+
+function knownPeers(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(KNOWN_KEY) ?? "{}") as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+function rememberPeer(id: string, name: string) {
+  const k = knownPeers();
+  k[id] = name;
+  localStorage.setItem(KNOWN_KEY, JSON.stringify(k));
+}
 
 // --- Yjs-Kern: Der Y.Doc ist die Source of Truth, der Editor hängt via yCollab dran.
 // Pro geöffneter Datei ein frischer Doc. Beim Session-Beitritt adoptiert der Gast den
@@ -48,6 +79,9 @@ let view: EditorView | null = null;
 type Mode = "idle" | "hosting" | "joined";
 let mode: Mode = "idle";
 let connected = false;
+// Beitritt vom Host bestätigt? Vorher fließen keine Sync-/Awareness-Bytes.
+let authorized = false;
+let pendingHello: { id: string; name: string } | null = null;
 let wiredFor: Y.Doc | null = null;
 // Gast-Seite: GUID des Host-Docs aus der laufenden Session (null = keine Session)
 let hostGuid: string | null = null;
@@ -76,7 +110,33 @@ const el = {
   recoveryBanner: document.querySelector<HTMLDivElement>("#recovery-banner")!,
   recover: document.querySelector<HTMLButtonElement>("#btn-recover")!,
   recoverDismiss: document.querySelector<HTMLButtonElement>("#btn-recover-dismiss")!,
+  joinBanner: document.querySelector<HTMLDivElement>("#join-banner")!,
+  jrText: document.querySelector<HTMLSpanElement>("#jr-text")!,
+  jrAccept: document.querySelector<HTMLButtonElement>("#btn-jr-accept")!,
+  jrReject: document.querySelector<HTMLButtonElement>("#btn-jr-reject")!,
+  lanList: document.querySelector<HTMLSpanElement>("#lan-list")!,
 };
+
+// LAN-Hosts aus der mDNS-Discovery (fullname → Eintrag)
+const lanHosts = new Map<string, { label: string; addr: string; id: string }>();
+
+function renderLanList() {
+  el.lanList.innerHTML = "";
+  if (mode !== "idle") return;
+  for (const [fullname, h] of lanHosts) {
+    if (h.id === myId) continue; // eigene Ansage nicht anbieten
+    const chip = document.createElement("button");
+    chip.className = "lan-chip";
+    chip.textContent = `⌂ ${h.label}`;
+    chip.title = `LAN-Session beitreten (${h.addr})`;
+    chip.addEventListener("click", () => {
+      el.joinInput.value = h.addr;
+      void joinSession();
+    });
+    el.lanList.appendChild(chip);
+    void fullname;
+  }
+}
 
 // Autoren-Register für die Legende: clientID → Name. Lebt pro Doc-Inkarnation;
 // Namen kommen aus der Awareness (verbundene Peers) bzw. dem eigenen Namensfeld.
@@ -200,6 +260,7 @@ function updateSessionUi() {
   el.open.disabled = mode !== "idle";
   if (mode === "idle") el.sessionCode.textContent = "";
   updateSaveButton();
+  renderLanList();
 }
 
 // Code in die Zwischenablage; Fallback: ins Join-Feld legen zum manuellen Kopieren
@@ -216,9 +277,26 @@ function copyCode(code: string, label: string) {
 // --- Transport-Brücke: Bytes rein/raus über Tauri; der Kanal dahinter ist austauschbar
 // (M2: TCP, M3: WebRTC-DataChannel). Das Protokoll-Framing hier bleibt identisch.
 
-function sendBytes(payload: Uint8Array) {
+// Roh-Senden für den Beitritts-Handshake (läuft VOR der Autorisierung)
+function rawSend(payload: Uint8Array) {
   if (!connected) return;
   void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
+}
+
+function sendBytes(payload: Uint8Array) {
+  if (!connected || !authorized) return;
+  void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
+}
+
+function sendControl(type: number, data: { id: string; name: string } | null) {
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, type);
+  encoding.writeVarString(enc, data ? JSON.stringify(data) : "{}");
+  rawSend(encoding.toUint8Array(enc));
+}
+
+function currentName(): string {
+  return el.nameInput.value.trim() || `Autor-${ydoc.clientID % 1000}`;
 }
 
 function sendHandshake() {
@@ -296,6 +374,32 @@ function handleIncoming(data: Uint8Array) {
       decoding.readVarUint8Array(dec),
       "remote",
     );
+  } else if (type === MSG_HELLO) {
+    if (mode !== "hosting") return;
+    let hello: { id?: string; name?: string };
+    try {
+      hello = JSON.parse(decoding.readVarString(dec)) as { id?: string; name?: string };
+    } catch {
+      return;
+    }
+    const peer = { id: hello.id ?? "", name: (hello.name ?? "Unbekannt").slice(0, 24) };
+    if (peer.id && knownPeers()[peer.id]) {
+      acceptPeer(peer);
+      status(`${peer.name} (bekannt) beigetreten`);
+    } else {
+      pendingHello = peer;
+      el.jrText.textContent = `„${peer.name}" möchte der Session beitreten.`;
+      el.joinBanner.hidden = false;
+    }
+  } else if (type === MSG_WELCOME) {
+    if (mode !== "joined") return;
+    authorized = true;
+    sendHandshake();
+    status("Beitritt bestätigt");
+  } else if (type === MSG_REJECT) {
+    if (mode !== "joined") return;
+    status("Der Host hat den Beitritt abgelehnt", true);
+    void leaveSession();
   } else if (type === MSG_META) {
     const guid = decoding.readVarString(dec);
     if (mode !== "joined") return;
@@ -421,7 +525,11 @@ async function hostSession() {
     return;
   }
   try {
-    const code = await invoke<string>("host_session", { port: SESSION_PORT });
+    const code = await invoke<string>("host_session", {
+      port: SESSION_PORT,
+      name: currentName(),
+      id: myId,
+    });
     mode = "hosting";
     wireDoc();
     // Session-Baseline: der vorgeladene Datei-Inhalt ist Bestand, kein Autoren-Text
@@ -516,10 +624,31 @@ async function joinSession() {
   }
 }
 
+// Host bestätigt einen Beitritt: Identität merken (TOFU), dann erst Sync starten
+function acceptPeer(peer: { id: string; name: string }) {
+  if (peer.id) rememberPeer(peer.id, peer.name);
+  pendingHello = null;
+  el.joinBanner.hidden = true;
+  authorized = true;
+  connStatus("verbunden");
+  sendControl(MSG_WELCOME, null);
+  sendHandshake();
+}
+
+function rejectPeer() {
+  pendingHello = null;
+  el.joinBanner.hidden = true;
+  sendControl(MSG_REJECT, null);
+  status("Beitritt abgelehnt — Verbindung wird getrennt");
+}
+
 async function leaveSession() {
   await invoke("leave_session").catch(() => {});
   mode = "idle";
   connected = false;
+  authorized = false;
+  pendingHello = null;
+  el.joinBanner.hidden = true;
   hostGuid = null;
   lastJoinedAddr = null;
   guestBaselinePending = false;
@@ -538,20 +667,39 @@ void listen<number[]>("net-recv", (e) => {
   handleIncoming(Uint8Array.from(e.payload));
 });
 
+void listen<{ fullname: string; label: string; addr: string; id: string }>(
+  "lan-found",
+  (e) => {
+    lanHosts.set(e.payload.fullname, e.payload);
+    renderLanList();
+  },
+);
+void listen<string>("lan-removed", (e) => {
+  lanHosts.delete(e.payload);
+  renderLanList();
+});
+
 void listen<string>("net-status", (e) => {
   const s = e.payload;
   if (s === "connected") {
     connected = true;
+    authorized = false;
     inetAwaitingAnswer = false;
-    connStatus("verbunden");
-    status("");
-    sendHandshake();
     updateSessionUi();
+    if (mode === "joined") {
+      connStatus("warte auf Bestätigung des Hosts …");
+      sendControl(MSG_HELLO, { id: myId, name: currentName() });
+    } else {
+      connStatus("Gast verbindet …");
+    }
   } else if (s === "listening") {
     connected = false;
     connStatus("wartet auf Peer …");
   } else if (s === "disconnected") {
     connected = false;
+    authorized = false;
+    pendingHello = null;
+    el.joinBanner.hidden = true;
     clearRemoteAwareness();
     if (mode === "hosting") {
       connStatus("wartet auf Peer …");
@@ -673,6 +821,13 @@ el.recover.addEventListener("click", async () => {
 });
 
 el.recoverDismiss.addEventListener("click", () => void clearRecovery());
+el.jrAccept.addEventListener("click", () => {
+  if (pendingHello) acceptPeer(pendingHello);
+});
+el.jrReject.addEventListener("click", rejectPeer);
+
+// mDNS-Discovery aktivieren (best effort — ohne sie fehlt nur die LAN-Liste)
+void invoke("lan_init").catch(() => {});
 
 void invoke<string>("recovery_file_path")
   .then(async (p) => {

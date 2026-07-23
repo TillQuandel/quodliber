@@ -21,9 +21,15 @@
           <input id="join-input" placeholder="ip:port oder QL1-Code" spellcheck="false" />
           <button id="btn-join" title="Mit Host-Code verbinden">Beitreten</button>
           <span id="session-code" class="code muted"></span>
+          <span id="lan-list" title="Im LAN gefundene Sessions"></span>
         </div>
         <div id="file-label" class="muted">Keine Datei geöffnet</div>
       </header>
+      <div id="join-banner" hidden>
+        <span id="jr-text"></span>
+        <button id="btn-jr-accept">Zulassen</button>
+        <button id="btn-jr-reject">Ablehnen</button>
+      </div>
       <div id="recovery-banner" hidden>
         <span>Nicht gespeicherte Crash-Kopie vom letzten Lauf gefunden.</span>
         <button id="btn-recover">Wiederherstellen</button>

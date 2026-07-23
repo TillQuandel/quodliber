@@ -85,7 +85,8 @@ body,
   max-width: 40%;
 }
 
-#recovery-banner {
+#recovery-banner,
+#join-banner {
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -93,6 +94,43 @@ body,
   font-size: 0.85rem;
   background: light-dark(#fff7e0, #3a3320);
   border-bottom: 1px solid light-dark(#e6c96b, #6b5d2a);
+}
+
+#join-banner {
+  background: light-dark(#e8f4fd, #1e2f3d);
+  border-bottom-color: light-dark(#7db8e8, #3a5a78);
+}
+
+#join-banner[hidden] {
+  display: none;
+}
+
+#join-banner button {
+  padding: 0.2rem 0.7rem;
+  border: 1px solid light-dark(#7db8e8, #3a5a78);
+  border-radius: 6px;
+  background: light-dark(#fff, #2a2a2a);
+  color: inherit;
+  cursor: pointer;
+}
+
+#lan-list {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.lan-chip {
+  padding: 0.25rem 0.6rem;
+  border: 1px dashed light-dark(#8bb, #577);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.lan-chip:hover {
+  background: light-dark(#eefafa, #1e3333);
 }
 
 #recovery-banner[hidden] {

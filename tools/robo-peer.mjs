@@ -13,6 +13,10 @@ import * as decoding from "lib0/decoding";
 
 const MSG_SYNC = 0;
 const MSG_AWARENESS = 1;
+const MSG_HELLO = 3;
+const MSG_WELCOME = 4;
+const MSG_REJECT = 5;
+const ROBO_ID = "robo-peer-1";
 const TARGET = process.argv[2] ?? "127.0.0.1:41420";
 const TYPE_MS = 150;
 const TYPE_SECONDS = 60;
@@ -89,17 +93,12 @@ function connect() {
   sock.setNoDelay(true);
 
   sock.on("connect", () => {
+    // Beitritts-Handshake: erst vorstellen, Sync startet nach WELCOME
     const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MSG_SYNC);
-    syncProtocol.writeSyncStep1(enc, doc);
+    encoding.writeVarUint(enc, MSG_HELLO);
+    encoding.writeVarString(enc, JSON.stringify({ id: ROBO_ID, name: "Robo" }));
     sendFrame(encoding.toUint8Array(enc));
-    const enc2 = encoding.createEncoder();
-    encoding.writeVarUint(enc2, MSG_AWARENESS);
-    encoding.writeVarUint8Array(
-      enc2,
-      awarenessProtocol.encodeAwarenessUpdate(awareness, [doc.clientID]),
-    );
-    sendFrame(encoding.toUint8Array(enc2));
+    console.log("[robo] HELLO gesendet — warte auf Host-Bestätigung …");
   });
 
   sock.on("data", (chunk) => {
@@ -127,6 +126,22 @@ function connect() {
           decoding.readVarUint8Array(dec),
           "remote",
         );
+      } else if (type === MSG_WELCOME) {
+        console.log("[robo] WELCOME — starte Sync");
+        const enc = encoding.createEncoder();
+        encoding.writeVarUint(enc, MSG_SYNC);
+        syncProtocol.writeSyncStep1(enc, doc);
+        sendFrame(encoding.toUint8Array(enc));
+        const enc2 = encoding.createEncoder();
+        encoding.writeVarUint(enc2, MSG_AWARENESS);
+        encoding.writeVarUint8Array(
+          enc2,
+          awarenessProtocol.encodeAwarenessUpdate(awareness, [doc.clientID]),
+        );
+        sendFrame(encoding.toUint8Array(enc2));
+      } else if (type === MSG_REJECT) {
+        console.error("[robo] Host hat abgelehnt — Ende");
+        process.exit(1);
       }
       // MSG_META (2) ignorieren — Robo joint immer frisch
     }

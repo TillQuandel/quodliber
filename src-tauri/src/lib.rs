@@ -22,6 +22,9 @@ struct NetState {
     tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
     // aktive WebRTC-PeerConnection (Internet-Session via Code-Tausch)
     pc: Mutex<Option<Arc<RTCPeerConnection>>>,
+    // mDNS: ein Daemon pro App; registrierter Service-Name beim Hosten
+    mdns: Mutex<Option<mdns_sd::ServiceDaemon>>,
+    mdns_fullname: Mutex<Option<String>>,
 }
 
 fn emit_status(app: &AppHandle, status: &str) {
@@ -94,6 +97,95 @@ fn leave_inner(app: &AppHandle) {
         tauri::async_runtime::spawn(async move {
             let _ = pc.close().await;
         });
+    }
+    // mDNS-Ansage zurückziehen (Daemon selbst bleibt für Browse bestehen)
+    let fullname = st.mdns_fullname.lock().unwrap().take();
+    if let Some(name) = fullname {
+        let guard = st.mdns.lock().unwrap();
+        if let Some(daemon) = guard.as_ref() {
+            let _ = daemon.unregister(&name);
+        }
+    }
+}
+
+// ---------- mDNS: LAN-Discovery (Host taucht in der Gast-Liste auf) ----------
+
+const MDNS_SERVICE: &str = "_quodliber._tcp.local.";
+
+#[derive(serde::Serialize, Clone)]
+struct LanHost {
+    fullname: String,
+    label: String,
+    addr: String,
+    id: String,
+}
+
+/// Einmal beim App-Start: mDNS-Daemon anlegen und dauerhaft nach Quodliber-
+/// Hosts im LAN browsen; Funde/Abgänge gehen als Events ans Frontend.
+#[tauri::command]
+fn lan_init(app: AppHandle) -> Result<(), String> {
+    let st = app.state::<NetState>();
+    let mut guard = st.mdns.lock().unwrap();
+    if guard.is_some() {
+        return Ok(());
+    }
+    let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| e.to_string())?;
+    let receiver = daemon.browse(MDNS_SERVICE).map_err(|e| e.to_string())?;
+    *guard = Some(daemon);
+    drop(guard);
+
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Ok(event) = receiver.recv_async().await {
+            match event {
+                mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                    let addr = info
+                        .get_addresses()
+                        .iter()
+                        .find(|a| a.is_ipv4())
+                        .or_else(|| info.get_addresses().iter().next())
+                        .map(|a| format!("{}:{}", a, info.get_port()));
+                    if let Some(addr) = addr {
+                        let host = LanHost {
+                            fullname: info.get_fullname().to_string(),
+                            label: info
+                                .get_property_val_str("name")
+                                .unwrap_or("Unbekannt")
+                                .to_string(),
+                            addr,
+                            id: info.get_property_val_str("id").unwrap_or("").to_string(),
+                        };
+                        let _ = app2.emit("lan-found", host);
+                    }
+                }
+                mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                    let _ = app2.emit("lan-removed", fullname);
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Beim Hosten: eigenen Service im LAN ansagen (best effort — Scheitern der
+/// Ansage verhindert die Session nicht, es fehlt dann nur der Listen-Eintrag).
+fn mdns_announce(app: &AppHandle, port: u16, name: &str, id: &str) {
+    let st = app.state::<NetState>();
+    let guard = st.mdns.lock().unwrap();
+    let Some(daemon) = guard.as_ref() else { return };
+    let instance = format!("{}-{}", name.replace('.', "_"), &id[..id.len().min(8)]);
+    let props = [("name", name), ("id", id)];
+    match mdns_sd::ServiceInfo::new(MDNS_SERVICE, &instance, &format!("{instance}.local."), "", port, &props[..])
+        .map(|s| s.enable_addr_auto())
+    {
+        Ok(service) => {
+            let fullname = service.get_fullname().to_string();
+            if daemon.register(service).is_ok() {
+                *st.mdns_fullname.lock().unwrap() = Some(fullname);
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -308,8 +400,14 @@ async fn webrtc_finish(app: AppHandle, code: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn host_session(app: AppHandle, port: u16) -> Result<String, String> {
+async fn host_session(
+    app: AppHandle,
+    port: u16,
+    name: String,
+    id: String,
+) -> Result<String, String> {
     leave_inner(&app);
+    mdns_announce(&app, port, &name, &id);
     // Kurzer Retry: der Task-Abort aus leave_inner gibt den Port asynchron frei —
     // direktes Re-Hosting auf demselben Port darf daran nicht scheitern.
     let listener = {
@@ -402,6 +500,8 @@ pub fn run() {
             outgoing: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             pc: Mutex::new(None),
+            mdns: Mutex::new(None),
+            mdns_fullname: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             read_file,
@@ -413,7 +513,8 @@ pub fn run() {
             leave_session,
             webrtc_offer,
             webrtc_accept,
-            webrtc_finish
+            webrtc_finish,
+            lan_init
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
