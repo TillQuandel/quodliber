@@ -54,11 +54,15 @@ let hostGuid: string | null = null;
 let lastJoinedAddr: string | null = null;
 // Gast-Seite: Baseline wird nach dem ersten SyncStep2 der Session gesetzt
 let guestBaselinePending = false;
+// Internet-Session (Host): Offer verschickt, Antwort-Code ausstehend
+let inetAwaitingAnswer = false;
+const CODE_PREFIX = "QL1-";
 
 const el = {
   open: document.querySelector<HTMLButtonElement>("#btn-open")!,
   save: document.querySelector<HTMLButtonElement>("#btn-save")!,
   host: document.querySelector<HTMLButtonElement>("#btn-host")!,
+  inet: document.querySelector<HTMLButtonElement>("#btn-inet")!,
   join: document.querySelector<HTMLButtonElement>("#btn-join")!,
   joinInput: document.querySelector<HTMLInputElement>("#join-input")!,
   nameInput: document.querySelector<HTMLInputElement>("#name-input")!,
@@ -177,16 +181,36 @@ function connStatus(text: string) {
 
 function updateSessionUi() {
   const rejoinable = mode === "joined" && !connected;
+  const answerPaste = mode === "hosting" && inetAwaitingAnswer;
   el.host.textContent =
     mode === "hosting" ? "Session beenden" : mode === "joined" ? "Verlassen" : "Session starten";
-  el.join.textContent = rejoinable ? "Erneut verbinden" : mode === "joined" ? "Verbunden" : "Beitreten";
+  el.join.textContent = answerPaste
+    ? "Verbinden"
+    : rejoinable
+      ? "Erneut verbinden"
+      : mode === "joined"
+        ? "Verbunden"
+        : "Beitreten";
   // Host-Button ist in jedem Modus die aktive Aktion (Starten/Beenden/Verlassen)
   el.host.disabled = false;
-  el.join.disabled = mode === "hosting" || (mode === "joined" && connected);
-  el.joinInput.disabled = mode !== "idle";
+  el.inet.disabled = mode !== "idle";
+  el.join.disabled = (mode === "hosting" && !answerPaste) || (mode === "joined" && connected);
+  el.joinInput.disabled = !(mode === "idle" || answerPaste);
+  el.joinInput.placeholder = answerPaste ? "Antwort-Code (QL1-…) einfügen" : "ip:port oder QL1-Code";
   el.open.disabled = mode !== "idle";
   if (mode === "idle") el.sessionCode.textContent = "";
   updateSaveButton();
+}
+
+// Code in die Zwischenablage; Fallback: ins Join-Feld legen zum manuellen Kopieren
+function copyCode(code: string, label: string) {
+  void navigator.clipboard.writeText(code).then(
+    () => status(`${label} kopiert — per Messenger an die Gegenseite senden`),
+    () => {
+      el.joinInput.value = code;
+      status(`${label} liegt im Eingabefeld — manuell kopieren (Strg+A, Strg+C)`, true);
+    },
+  );
 }
 
 // --- Transport-Brücke: Bytes rein/raus über Tauri; der Kanal dahinter ist austauschbar
@@ -413,10 +437,60 @@ async function hostSession() {
 }
 
 async function joinSession() {
+  // Host-Seite einer Internet-Session: Eingabe ist der Antwort-Code des Gasts
+  if (mode === "hosting" && inetAwaitingAnswer) {
+    const answer = el.joinInput.value.trim();
+    if (!answer.startsWith(CODE_PREFIX)) {
+      status("Antwort-Code (QL1-…) des Gasts einfügen", true);
+      return;
+    }
+    try {
+      await invoke("webrtc_finish", { code: answer });
+      inetAwaitingAnswer = false;
+      el.joinInput.value = "";
+      updateSessionUi();
+      connStatus("verbinde …");
+      status("Code angenommen — ICE verhandelt die Verbindung");
+    } catch (e) {
+      status(String(e), true);
+    }
+    return;
+  }
+
   const rejoin = mode === "joined" && !connected;
   const addr = rejoin ? lastJoinedAddr! : el.joinInput.value.trim();
+
+  // Internet-Gast: QL1-Offer-Code statt ip:port
+  if (!rejoin && addr.startsWith(CODE_PREFIX)) {
+    resetDoc("");
+    currentPath = null;
+    hostGuid = null;
+    guestBaselinePending = true;
+    el.fileLabel.textContent = "(Session-Dokument)";
+    mode = "joined";
+    wireDoc();
+    updateSessionUi();
+    try {
+      status("Erzeuge Antwort-Code … (STUN-Abfrage, wenige Sekunden)");
+      const answer = await invoke<string>("webrtc_accept", { code: addr });
+      lastJoinedAddr = addr;
+      el.joinInput.value = "";
+      copyCode(answer, "Antwort-Code");
+      connStatus("warte auf Host …");
+    } catch (e) {
+      mode = "idle";
+      updateSessionUi();
+      status(String(e), true);
+    }
+    return;
+  }
+  if (rejoin && lastJoinedAddr?.startsWith(CODE_PREFIX)) {
+    status("Internet-Session braucht einen frischen Code — verlassen und neu beitreten", true);
+    return;
+  }
+
   if (!addr || !addr.includes(":")) {
-    status("Adresse als ip:port eingeben", true);
+    status("Adresse als ip:port eingeben (oder QL1-Code einfügen)", true);
     return;
   }
   if (!rejoin) {
@@ -449,6 +523,7 @@ async function leaveSession() {
   hostGuid = null;
   lastJoinedAddr = null;
   guestBaselinePending = false;
+  inetAwaitingAnswer = false;
   // Baseline bleibt: die Session-Färbung („wer hat was geschrieben") überlebt
   // das Session-Ende, bis eine Datei neu geöffnet wird.
   clearRemoteAwareness();
@@ -467,6 +542,7 @@ void listen<string>("net-status", (e) => {
   const s = e.payload;
   if (s === "connected") {
     connected = true;
+    inetAwaitingAnswer = false;
     connStatus("verbunden");
     status("");
     sendHandshake();
@@ -492,9 +568,32 @@ void listen<string>("net-status", (e) => {
 
 // --- UI-Verkabelung ---
 
+// Internet-Session (Host): Offer-Code erzeugen und teilen
+async function hostInternet() {
+  if (mode !== "idle") {
+    status("Erst die aktuelle Session beenden", true);
+    return;
+  }
+  try {
+    status("Erzeuge Internet-Code … (STUN-Abfrage, wenige Sekunden)");
+    const code = await invoke<string>("webrtc_offer");
+    mode = "hosting";
+    inetAwaitingAnswer = true;
+    wireDoc();
+    captureBaseline(ydoc);
+    refreshAuthorUi();
+    updateSessionUi();
+    connStatus("warte auf Antwort-Code …");
+    copyCode(code, "Internet-Code");
+  } catch (e) {
+    status(String(e), true);
+  }
+}
+
 el.open.addEventListener("click", openFile);
 el.save.addEventListener("click", saveFile);
 el.host.addEventListener("click", hostSession);
+el.inet.addEventListener("click", hostInternet);
 el.join.addEventListener("click", joinSession);
 el.colorsToggle.addEventListener("click", () => {
   const on = toggleColoring();

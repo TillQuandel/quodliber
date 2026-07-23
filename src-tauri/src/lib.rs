@@ -1,5 +1,14 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use bytes::Bytes;
 use tauri::{AppHandle, Emitter, Manager, State};
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
 // Manager liefert auch app.path() für den Recovery-Pfad
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +20,8 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 struct NetState {
     outgoing: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
     tasks: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    // aktive WebRTC-PeerConnection (Internet-Session via Code-Tausch)
+    pc: Mutex<Option<Arc<RTCPeerConnection>>>,
 }
 
 fn emit_status(app: &AppHandle, status: &str) {
@@ -78,6 +89,222 @@ fn leave_inner(app: &AppHandle) {
     for h in st.tasks.lock().unwrap().drain(..) {
         h.abort();
     }
+    let taken = st.pc.lock().unwrap().take();
+    if let Some(pc) = taken {
+        tauri::async_runtime::spawn(async move {
+            let _ = pc.close().await;
+        });
+    }
+}
+
+// ---------- WebRTC (M3: Internet-Session via manuellem Code-Tausch) ----------
+
+// Codes tragen ein Versions-Präfix, damit das Join-Feld sie von ip:port
+// unterscheiden kann und künftige Formatwechsel erkennbar bleiben.
+const CODE_PREFIX: &str = "QL1-";
+// DataChannel-Nachrichten klein halten (SCTP-Limits); Frames werden gestückelt
+// und über das u32-BE-Längenprefix wieder zusammengesetzt — gleiches Framing wie TCP.
+const DC_CHUNK: usize = 16_000;
+
+fn encode_desc(desc: &RTCSessionDescription) -> Result<String, String> {
+    let json = serde_json::to_string(desc).map_err(|e| e.to_string())?;
+    Ok(format!("{CODE_PREFIX}{}", B64.encode(json)))
+}
+
+fn decode_desc(code: &str) -> Result<RTCSessionDescription, String> {
+    let raw = code
+        .trim()
+        .strip_prefix(CODE_PREFIX)
+        .ok_or("Kein QL1-Code")?;
+    let json = B64.decode(raw).map_err(|_| "Code beschädigt (Base64)")?;
+    serde_json::from_slice(&json).map_err(|_| "Code beschädigt (Inhalt)".to_string())
+}
+
+async fn new_pc(app: &AppHandle) -> Result<Arc<RTCPeerConnection>, String> {
+    let api = APIBuilder::new().build();
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            // Mehrere STUN-Fallbacks; Google ist offiziell nur Dev-Nutzung —
+            // für eine spätere kommerzielle Phase eigene Liste/coturn einplanen.
+            urls: vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun.cloudflare.com:3478".to_string(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let pc = api
+        .new_peer_connection(config)
+        .await
+        .map_err(|e| e.to_string())
+        .map(Arc::new)?;
+
+    // Verbindungsabbrüche nach dem Aufbau sichtbar machen
+    let app2 = app.clone();
+    pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        let app3 = app2.clone();
+        Box::pin(async move {
+            if matches!(
+                s,
+                RTCPeerConnectionState::Failed
+                    | RTCPeerConnectionState::Disconnected
+                    | RTCPeerConnectionState::Closed
+            ) {
+                let st = app3.state::<NetState>();
+                *st.outgoing.lock().unwrap() = None;
+                emit_status(&app3, "disconnected");
+            }
+        })
+    }));
+    Ok(pc)
+}
+
+/// DataChannel an die bestehende Byte-Brücke hängen: gleiche net-recv/net-status-
+/// Events und derselbe outgoing-Kanal wie beim TCP-Transport.
+fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
+    let recv_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let app_open = app.clone();
+    let dc_open = dc.clone();
+    dc.on_open(Box::new(move || {
+        let app2 = app_open.clone();
+        let dc2 = dc_open.clone();
+        Box::pin(async move {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            *app2.state::<NetState>().outgoing.lock().unwrap() = Some(tx);
+            emit_status(&app2, "connected");
+            let h = tauri::async_runtime::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    let mut framed = Vec::with_capacity(4 + data.len());
+                    framed.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                    framed.extend_from_slice(&data);
+                    for chunk in framed.chunks(DC_CHUNK) {
+                        if dc2.send(&Bytes::copy_from_slice(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            app2.state::<NetState>().tasks.lock().unwrap().push(h);
+        })
+    }));
+
+    let app_msg = app.clone();
+    dc.on_message(Box::new(move |msg| {
+        let app2 = app_msg.clone();
+        let buf = recv_buf.clone();
+        Box::pin(async move {
+            let frames = {
+                let mut b = buf.lock().unwrap();
+                b.extend_from_slice(&msg.data);
+                let mut out = Vec::new();
+                loop {
+                    if b.len() < 4 {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+                    if len > MAX_FRAME {
+                        b.clear();
+                        break;
+                    }
+                    if b.len() < 4 + len {
+                        break;
+                    }
+                    out.push(b[4..4 + len].to_vec());
+                    b.drain(..4 + len);
+                }
+                out
+            };
+            for f in frames {
+                let _ = app2.emit("net-recv", f);
+            }
+        })
+    }));
+
+    let app_close = app.clone();
+    dc.on_close(Box::new(move || {
+        let app2 = app_close.clone();
+        Box::pin(async move {
+            let st = app2.state::<NetState>();
+            *st.outgoing.lock().unwrap() = None;
+            emit_status(&app2, "disconnected");
+        })
+    }));
+}
+
+/// Host: Offer-Code erzeugen (Vanilla-ICE — wartet auf Gathering-complete,
+/// der Code enthält damit alle Candidates für den Einmal-Austausch).
+#[tauri::command]
+async fn webrtc_offer(app: AppHandle) -> Result<String, String> {
+    leave_inner(&app);
+    let pc = new_pc(&app).await?;
+    let dc = pc
+        .create_data_channel("quodliber", None)
+        .await
+        .map_err(|e| e.to_string())?;
+    wire_datachannel(&app, dc);
+
+    let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
+    let mut gather = pc.gathering_complete_promise().await;
+    pc.set_local_description(offer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = gather.recv().await;
+    let desc = pc
+        .local_description()
+        .await
+        .ok_or("Kein Local-Description-Stand")?;
+    let code = encode_desc(&desc)?;
+    *app.state::<NetState>().pc.lock().unwrap() = Some(pc);
+    Ok(code)
+}
+
+/// Gast: Offer-Code annehmen, Antwort-Code erzeugen.
+#[tauri::command]
+async fn webrtc_accept(app: AppHandle, code: String) -> Result<String, String> {
+    leave_inner(&app);
+    let pc = new_pc(&app).await?;
+
+    let app2 = app.clone();
+    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        wire_datachannel(&app2, dc);
+        Box::pin(async {})
+    }));
+
+    let offer = decode_desc(&code)?;
+    pc.set_remote_description(offer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
+    let mut gather = pc.gathering_complete_promise().await;
+    pc.set_local_description(answer)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = gather.recv().await;
+    let desc = pc
+        .local_description()
+        .await
+        .ok_or("Kein Local-Description-Stand")?;
+    let code = encode_desc(&desc)?;
+    *app.state::<NetState>().pc.lock().unwrap() = Some(pc);
+    Ok(code)
+}
+
+/// Host: Antwort-Code des Gasts einspielen — danach verbindet ICE selbstständig.
+#[tauri::command]
+async fn webrtc_finish(app: AppHandle, code: String) -> Result<(), String> {
+    let answer = decode_desc(&code)?;
+    let pc = app
+        .state::<NetState>()
+        .pc
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("Keine wartende Internet-Session")?;
+    pc.set_remote_description(answer)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -174,6 +401,7 @@ pub fn run() {
         .manage(NetState {
             outgoing: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            pc: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             read_file,
@@ -182,7 +410,10 @@ pub fn run() {
             host_session,
             join_session,
             net_send,
-            leave_session
+            leave_session,
+            webrtc_offer,
+            webrtc_accept,
+            webrtc_finish
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
