@@ -23,6 +23,18 @@ export const PALETTE = [
 
 export const paletteFor = (clientId: number) => PALETTE[clientId % PALETTE.length];
 
+/** Kollisionsfreie Farbzuordnung: Autoren nach clientID sortiert → Palette der
+ * Reihe nach. Beide Replikate sehen (konvergiert) dieselbe Autorenmenge und
+ * rechnen daher identische Farben; ≤8 Autoren sind garantiert verschieden. */
+export function orderedPalette(runs: AuthorRun[]): Map<number, (typeof PALETTE)[number]> {
+  const clients = [...new Set(runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client))].sort(
+    (a, b) => a - b,
+  );
+  const map = new Map<number, (typeof PALETTE)[number]>();
+  clients.forEach((c, i) => map.set(c, PALETTE[i % PALETTE.length]));
+  return map;
+}
+
 /** Signalisiert dem Editor, dass Autoren-Darstellung neu gerechnet werden muss
  * (Baseline gesetzt, Fokus gewechselt, Färbung an/aus). */
 export const authorsRefresh = StateEffect.define<null>();
@@ -145,12 +157,13 @@ export function authorColoring(getYText: () => Y.Text, isSessionTab: () => boole
         const inSession = isSessionTab();
         const runs = authorRuns(getYText(), inSession);
         if (!coloringActive(runs, inSession)) return Decoration.none;
+        const colors = orderedPalette(runs);
         const docLen = view.state.doc.length;
         const marks = [];
         for (const r of runs) {
           if (r.client === NEUTRAL) continue;
           if (focusedAuthor !== null && r.client !== focusedAuthor) continue;
-          const pal = paletteFor(r.client);
+          const pal = colors.get(r.client) ?? paletteFor(r.client);
           const bg = focusedAuthor === r.client ? `${pal.color}55` : pal.light;
           // Clamp: ytext und CM-Doc sind via yCollab synchron, defensiv gegen
           // RangeErrors bei gebatchten Remote-Updates.

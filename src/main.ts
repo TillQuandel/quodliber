@@ -20,7 +20,7 @@ import {
   clearBaseline,
   coloringActive,
   focusedAuthorId,
-  NEUTRAL,
+  orderedPalette,
   paletteFor,
   toggleColoring,
   toggleFocus,
@@ -392,13 +392,13 @@ function updateLegend() {
   const inSession = active === sessionTab;
   const runs = authorRuns(active.ytext, inSession);
   if (!coloringActive(runs, inSession)) return;
-  const clients = new Set(runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client));
-  for (const id of clients) {
+  const colors = orderedPalette(runs);
+  for (const [id, pal] of colors) {
     const chip = document.createElement("span");
     chip.className = "author-chip";
     if (focusedAuthorId() === id) chip.classList.add("focused");
-    chip.style.backgroundColor = paletteFor(id).light;
-    chip.style.borderColor = paletteFor(id).color;
+    chip.style.backgroundColor = pal.light;
+    chip.style.borderColor = pal.color;
     chip.textContent = authorName(id);
     chip.title = "Klick: diesen Autor hervorheben";
     chip.addEventListener("click", () => {
@@ -406,6 +406,20 @@ function updateLegend() {
       refreshAuthorUi();
     });
     el.legend.appendChild(chip);
+  }
+  // Cursor-Farbe an die ordnungsbasierte Textfarbe angleichen (die Gegenseite
+  // rendert unseren Cursor mit der ANGEKÜNDIGTEN Farbe — nachziehen, sobald
+  // sich unsere Position in der Autoren-Reihenfolge ändert)
+  const myPal = colors.get(active.ydoc.clientID);
+  if (myPal) {
+    const st = active.awareness.getLocalState() as { user?: { color?: string } } | null;
+    if (st?.user && st.user.color !== myPal.color) {
+      active.awareness.setLocalStateField("user", {
+        ...st.user,
+        color: myPal.color,
+        colorLight: myPal.light,
+      });
+    }
   }
 }
 
@@ -559,6 +573,7 @@ function acceptPeer(peer: { id: string; name: string }) {
   connStatus("verbunden");
   sendControl(MSG_WELCOME, null);
   sendHandshake();
+  updateSessionUi();
 }
 
 function rejectPeer() {
@@ -614,6 +629,8 @@ function handleIncoming(data: Uint8Array) {
     if (mode !== "joined") return;
     authorized = true;
     sendHandshake();
+    connStatus("verbunden");
+    updateSessionUi();
     status("Beitritt bestätigt");
   } else if (type === MSG_REJECT) {
     if (mode !== "joined") return;
