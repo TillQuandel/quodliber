@@ -43,11 +43,13 @@ const MSG_PING = 6;
 const SESSION_PORT = 41420;
 const PING_MS = 5000;
 const STALE_MS = 15000;
+const CODE_PREFIX = "QL1-";
 
 // Persistente Install-Identität (v0: zufällige ID, keine Kryptografie —
 // spoofbar, fürs LAN-/Bekannten-Szenario akzeptiert; echte Schlüssel später)
 const IDENTITY_KEY = "quodliber-id";
 const KNOWN_KEY = "quodliber-known-peers";
+const NAME_STORAGE_KEY = "quodliber-name";
 const myId = (() => {
   let v = localStorage.getItem(IDENTITY_KEY);
   if (!v) {
@@ -70,41 +72,46 @@ function rememberPeer(id: string, name: string) {
   localStorage.setItem(KNOWN_KEY, JSON.stringify(k));
 }
 
-// --- Yjs-Kern: Der Y.Doc ist die Source of Truth, der Editor hängt via yCollab dran.
-// Pro geöffneter Datei ein frischer Doc. Beim Session-Beitritt adoptiert der Gast den
-// Host-State (eigener Doc wird leer zurückgesetzt) — nie zwei unabhängige Historien.
-let ydoc = new Y.Doc();
-let ytext = ydoc.getText("content");
-let awareness = new Awareness(ydoc);
-let undoManager = new Y.UndoManager(ytext);
+// ---------------------------------------------------------------------------
+// Tabs: jeder Tab trägt seinen eigenen Yjs-Kontext. Die Session teilt genau
+// EINEN Tab (sessionTab); alle anderen Tabs sind rein lokal — auch beim Gast.
+// ---------------------------------------------------------------------------
 
-let currentPath: string | null = null;
-let view: EditorView | null = null;
+interface Tab {
+  id: number;
+  path: string | null;
+  ydoc: Y.Doc;
+  ytext: Y.Text;
+  awareness: Awareness;
+  undoManager: Y.UndoManager;
+  autosaveTimer: number | undefined;
+  closeArmed: boolean;
+}
+
+let nextTabId = 1;
+const tabs: Tab[] = [];
+let active: Tab;
+let sessionTab: Tab | null = null;
 
 type Mode = "idle" | "hosting" | "joined";
 let mode: Mode = "idle";
 let connected = false;
-// Beitritt vom Host bestätigt? Vorher fließen keine Sync-/Awareness-Bytes.
 let authorized = false;
 let pendingHello: { id: string; name: string } | null = null;
-let wiredFor: Y.Doc | null = null;
-// Gast-Seite: GUID des Host-Docs aus der laufenden Session (null = keine Session)
 let hostGuid: string | null = null;
 let lastJoinedAddr: string | null = null;
-// Gast-Seite: Baseline wird nach dem ersten SyncStep2 der Session gesetzt
 let guestBaselinePending = false;
-// Internet-Session (Host): Offer verschickt, Antwort-Code ausstehend
 let inetAwaitingAnswer = false;
-const CODE_PREFIX = "QL1-";
-// Transport der aktiven Host-Session (Auto-Rehost geht nur bei TCP)
 let hostTransport: "tcp" | "inet" | null = null;
-// Heartbeat + Auto-Reconnect
 let lastRecv = 0;
 let pingTimer: number | undefined;
 let watchdogTimer: number | undefined;
 let rejoinTimer: number | undefined;
 let rejoinAttempt = 0;
 const REJOIN_MAX = 6;
+
+let view: EditorView | null = null;
+let recoveryPath: string | null = null;
 
 const el = {
   open: document.querySelector<HTMLButtonElement>("#btn-open")!,
@@ -130,48 +137,219 @@ const el = {
   jrAccept: document.querySelector<HTMLButtonElement>("#btn-jr-accept")!,
   jrReject: document.querySelector<HTMLButtonElement>("#btn-jr-reject")!,
   lanList: document.querySelector<HTMLSpanElement>("#lan-list")!,
+  tabbar: document.querySelector<HTMLDivElement>("#tabbar")!,
+  newTab: document.querySelector<HTMLButtonElement>("#btn-new-tab")!,
 };
 
-// LAN-Hosts aus der mDNS-Discovery (fullname → Eintrag)
-const lanHosts = new Map<string, { label: string; addr: string; id: string }>();
-
-function renderLanList() {
-  el.lanList.innerHTML = "";
-  if (mode !== "idle") return;
-  // Kein Selbst-Filter: nur Hosts senden Ansagen, und im Hosting-Modus ist die
-  // Liste ausgeblendet — ein Filter über die Install-Identität würde auf einem
-  // Rechner mit zwei Fenstern (geteilte localStorage) das Nachbarfenster verstecken.
-  for (const [fullname, h] of lanHosts) {
-    const chip = document.createElement("button");
-    chip.className = "lan-chip";
-    chip.textContent = `⌂ ${h.label}`;
-    chip.title = `LAN-Session beitreten (${h.addr})`;
-    chip.addEventListener("click", () => {
-      el.joinInput.value = h.addr;
-      void joinSession();
-    });
-    el.lanList.appendChild(chip);
-    void fullname;
-  }
-}
-
-// Autoren-Register für die Legende: clientID → Name. Lebt pro Doc-Inkarnation;
-// Namen kommen aus der Awareness (verbundene Peers) bzw. dem eigenen Namensfeld.
+// Autoren-Register für die Legende: clientID → Name (lebt pro Session-Doc)
 const authorNames = new Map<number, string>();
-
-const NAME_STORAGE_KEY = "quodliber-name";
 
 function authorName(clientId: number): string {
   return authorNames.get(clientId) ?? `Autor-${clientId % 1000}`;
 }
 
-function localUser() {
-  const custom = el.nameInput.value.trim();
-  const name = custom || `Autor-${ydoc.clientID % 1000}`;
-  const pal = paletteFor(ydoc.clientID);
-  authorNames.set(ydoc.clientID, name);
+function status(msg: string, isError = false) {
+  el.statusMsg.textContent = msg;
+  el.statusMsg.classList.toggle("error", isError);
+}
+
+function connStatus(text: string) {
+  el.statusConn.textContent = text;
+}
+
+function currentName(): string {
+  const t = sessionTab ?? active;
+  return el.nameInput.value.trim() || `Autor-${t.ydoc.clientID % 1000}`;
+}
+
+function localUser(tab: Tab) {
+  const name = el.nameInput.value.trim() || `Autor-${tab.ydoc.clientID % 1000}`;
+  const pal = paletteFor(tab.ydoc.clientID);
+  authorNames.set(tab.ydoc.clientID, name);
   return { name, color: pal.color, colorLight: pal.light };
 }
+
+// --- Tab-Verwaltung ---
+
+function tabLabel(tab: Tab): string {
+  if (tab.path) {
+    const parts = tab.path.split(/[\\/]/);
+    return parts[parts.length - 1] || tab.path;
+  }
+  if (tab === sessionTab && mode === "joined") return "(Session)";
+  return `Neu ${tab.id}`;
+}
+
+function updateTabBar() {
+  el.tabbar.querySelectorAll(".tab").forEach((n) => n.remove());
+  for (const tab of tabs) {
+    const btn = document.createElement("button");
+    btn.className = "tab" + (tab === active ? " active" : "") + (tab === sessionTab ? " shared" : "");
+    const label = document.createElement("span");
+    label.textContent = (tab === sessionTab ? "⇄ " : "") + tabLabel(tab);
+    btn.appendChild(label);
+    const close = document.createElement("span");
+    close.className = "tab-close";
+    close.textContent = tab.closeArmed ? "×?" : "×";
+    close.title =
+      tab === sessionTab && mode !== "idle"
+        ? "Geteilter Tab — erst Session beenden"
+        : tab.closeArmed
+          ? "Nochmal klicken: schließt OHNE Speichern"
+          : "Tab schließen";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeTab(tab);
+    });
+    btn.appendChild(close);
+    btn.title = tab.path ?? "";
+    btn.addEventListener("click", () => switchTab(tab));
+    el.tabbar.insertBefore(btn, el.newTab);
+  }
+}
+
+function registerTabObservers(tab: Tab) {
+  tab.ydoc.on("update", (update: Uint8Array, origin: unknown) => {
+    if (tab === active) updateLegend();
+    scheduleAutosave(tab);
+    // Netz-Weiterleitung: nur der geteilte Tab synct
+    if (tab !== sessionTab || origin === "remote" || !connected || !authorized) return;
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MSG_SYNC);
+    syncProtocol.writeUpdate(enc, update);
+    sendBytes(encoding.toUint8Array(enc));
+  });
+  tab.awareness.on(
+    "update",
+    (
+      changes: { added: number[]; updated: number[]; removed: number[] },
+      origin: unknown,
+    ) => {
+      harvestAwarenessNames(tab);
+      if (tab === active) updateLegend();
+      if (tab !== sessionTab || origin === "remote" || !connected || !authorized) return;
+      const changed = changes.added.concat(changes.updated, changes.removed);
+      const enc = encoding.createEncoder();
+      encoding.writeVarUint(enc, MSG_AWARENESS);
+      encoding.writeVarUint8Array(
+        enc,
+        awarenessProtocol.encodeAwarenessUpdate(tab.awareness, changed),
+      );
+      sendBytes(encoding.toUint8Array(enc));
+    },
+  );
+}
+
+function createTab(contents: string, path: string | null): Tab {
+  const ydoc = new Y.Doc();
+  const ytext = ydoc.getText("content");
+  if (contents.length > 0) ytext.insert(0, contents);
+  const tab: Tab = {
+    id: nextTabId++,
+    path,
+    ydoc,
+    ytext,
+    awareness: new Awareness(ydoc),
+    undoManager: new Y.UndoManager(ytext),
+    autosaveTimer: undefined,
+    closeArmed: false,
+  };
+  registerTabObservers(tab);
+  tabs.push(tab);
+  return tab;
+}
+
+/// Doc eines Tabs in-place ersetzen (Session-Umschwenk: GUID-Wechsel,
+/// Datei-Wechsel des Hosts). Kein Merge mit Vorzustand — frische Historie.
+function replaceDoc(tab: Tab, contents: string) {
+  tab.awareness.destroy();
+  tab.ydoc.destroy();
+  clearTimeout(tab.autosaveTimer);
+  tab.ydoc = new Y.Doc();
+  tab.ytext = tab.ydoc.getText("content");
+  if (contents.length > 0) tab.ytext.insert(0, contents);
+  tab.awareness = new Awareness(tab.ydoc);
+  tab.undoManager = new Y.UndoManager(tab.ytext);
+  registerTabObservers(tab);
+  if (tab === sessionTab) {
+    authorNames.clear();
+    clearBaseline();
+  }
+  if (tab === active) mountEditor();
+  updateTabBar();
+  updateLegend();
+}
+
+function switchTab(tab: Tab) {
+  if (tab === active) return;
+  active = tab;
+  mountEditor();
+  updateFileLabel();
+  updateTabBar();
+  updateLegend();
+  updateSessionUi();
+}
+
+function closeTab(tab: Tab) {
+  if (tab === sessionTab && mode !== "idle") {
+    status("Geteilter Tab — erst die Session beenden", true);
+    return;
+  }
+  // Ungespeicherten Inhalt nicht per Fehlklick verlieren: zweiter Klick nötig
+  if (tab.path === null && tab.ytext.length > 0 && !tab.closeArmed) {
+    tab.closeArmed = true;
+    updateTabBar();
+    status("Tab hat ungespeicherten Inhalt — zum Schließen nochmal × klicken", true);
+    window.setTimeout(() => {
+      tab.closeArmed = false;
+      updateTabBar();
+    }, 4000);
+    return;
+  }
+  tab.awareness.destroy();
+  tab.ydoc.destroy();
+  clearTimeout(tab.autosaveTimer);
+  const idx = tabs.indexOf(tab);
+  tabs.splice(idx, 1);
+  if (tab === sessionTab) sessionTab = null;
+  if (tabs.length === 0) {
+    active = createTab("", null);
+  } else if (tab === active) {
+    active = tabs[Math.max(0, idx - 1)];
+  }
+  mountEditor();
+  updateFileLabel();
+  updateTabBar();
+  updateLegend();
+  updateSessionUi();
+}
+
+function updateFileLabel() {
+  el.fileLabel.textContent =
+    active.path ?? (active === sessionTab && mode === "joined" ? "(Session-Dokument)" : `Neu ${active.id}`);
+}
+
+// --- Editor ---
+
+function mountEditor() {
+  view?.destroy();
+  const tab = active;
+  tab.awareness.setLocalStateField("user", localUser(tab));
+  const state = EditorState.create({
+    doc: tab.ytext.toString(),
+    extensions: [
+      keymap.of(yUndoManagerKeymap),
+      basicSetup,
+      markdown(),
+      EditorView.lineWrapping,
+      yCollab(tab.ytext, tab.awareness, { undoManager: tab.undoManager }),
+      authorColoring(() => tab.ytext),
+    ],
+  });
+  view = new EditorView({ state, parent: el.editor });
+}
+
+// --- Autoren-Legende ---
 
 function refreshAuthorUi() {
   view?.dispatch({ effects: authorsRefresh.of(null) });
@@ -180,11 +358,9 @@ function refreshAuthorUi() {
 
 function updateLegend() {
   el.legend.innerHTML = "";
-  const runs = authorRuns(ytext);
+  const runs = authorRuns(active.ytext);
   if (!coloringActive(runs)) return;
-  const clients = new Set(
-    runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client),
-  );
+  const clients = new Set(runs.filter((r) => r.client !== NEUTRAL).map((r) => r.client));
   for (const id of clients) {
     const chip = document.createElement("span");
     chip.className = "author-chip";
@@ -201,45 +377,41 @@ function updateLegend() {
   }
 }
 
-function harvestAwarenessNames() {
-  for (const [id, state] of awareness.getStates()) {
+function harvestAwarenessNames(tab: Tab) {
+  if (tab !== sessionTab && tab !== active) return;
+  for (const [id, state] of tab.awareness.getStates()) {
     const name = (state as { user?: { name?: string } }).user?.name;
     if (name) authorNames.set(id, name);
   }
 }
 
-// Beobachter pro Doc-Inkarnation: Legende bei Text- und Namensänderungen nachziehen
-function registerDocObservers() {
-  ydoc.on("update", () => {
-    updateLegend();
-    scheduleAutosave();
-  });
-  awareness.on("change", () => {
-    harvestAwarenessNames();
-    updateLegend();
-  });
+function clearRemoteAwareness() {
+  const t = sessionTab;
+  if (!t) return;
+  const remote = [...t.awareness.getStates().keys()].filter((id) => id !== t.ydoc.clientID);
+  if (remote.length > 0) {
+    awarenessProtocol.removeAwarenessStates(t.awareness, remote, "remote");
+  }
 }
 
-// --- Auto-Sichern: Host/Solo mit Pfad → in die Datei; Gast ohne Pfad → Crash-Kopie
-// im App-Datenordner (wird beim nächsten Start gemeldet).
+// --- Auto-Sichern: Tab mit Pfad → in die Datei; geteilter Tab ohne Pfad
+// (Gast) → Crash-Kopie im App-Datenordner.
 
-let recoveryPath: string | null = null;
-let autosaveTimer: number | undefined;
-
-function scheduleAutosave() {
-  clearTimeout(autosaveTimer);
-  autosaveTimer = window.setTimeout(() => void autosave(), 2000);
+function scheduleAutosave(tab: Tab) {
+  clearTimeout(tab.autosaveTimer);
+  tab.autosaveTimer = window.setTimeout(() => void autosave(tab), 2000);
 }
 
-async function autosave() {
-  const text = ytext.toString();
+async function autosave(tab: Tab) {
+  if (!tabs.includes(tab)) return;
+  const text = tab.ytext.toString();
   try {
-    if (currentPath) {
-      await invoke("write_file", { path: currentPath, contents: text });
-      if (!el.statusMsg.textContent || el.statusMsg.textContent.startsWith("Auto")) {
+    if (tab.path) {
+      await invoke("write_file", { path: tab.path, contents: text });
+      if (tab === active && (!el.statusMsg.textContent || el.statusMsg.textContent.startsWith("Auto"))) {
         status(`Auto-gespeichert ${new Date().toLocaleTimeString()}`);
       }
-    } else if (recoveryPath && text.length > 0) {
+    } else if (tab === sessionTab && recoveryPath && text.length > 0) {
       await invoke("write_file", { path: recoveryPath, contents: text });
     }
   } catch {
@@ -247,14 +419,7 @@ async function autosave() {
   }
 }
 
-function status(msg: string, isError = false) {
-  el.statusMsg.textContent = msg;
-  el.statusMsg.classList.toggle("error", isError);
-}
-
-function connStatus(text: string) {
-  el.statusConn.textContent = text;
-}
+// --- Session-UI ---
 
 function updateSessionUi() {
   const rejoinable = mode === "joined" && !connected;
@@ -268,36 +433,38 @@ function updateSessionUi() {
       : mode === "joined"
         ? "Verbunden"
         : "Beitreten";
-  // Host-Button ist in jedem Modus die aktive Aktion (Starten/Beenden/Verlassen)
   el.host.disabled = false;
   el.inet.disabled = mode !== "idle";
   el.join.disabled = (mode === "hosting" && !answerPaste) || (mode === "joined" && connected);
   el.joinInput.disabled = !(mode === "idle" || answerPaste);
   el.joinInput.placeholder = answerPaste ? "Antwort-Code (QL1-…) einfügen" : "ip:port oder QL1-Code";
-  el.open.disabled = mode === "joined";
+  el.open.disabled = false;
   el.open.title =
-    mode === "joined"
-      ? "Als Gast gesperrt — die geteilte Datei wählt der Host"
-      : "Textdatei öffnen" + (mode === "hosting" ? " (wird sofort in der Session geteilt)" : "");
+    mode === "hosting" && active === sessionTab
+      ? "Datei öffnen — ersetzt das geteilte Dokument für alle"
+      : "Textdatei in neuem Tab öffnen";
   if (mode === "idle") el.sessionCode.textContent = "";
-  // Rechte-Transparenz: wer darf was — damit Gesperrtes nicht rätselhaft bleibt
   if (mode === "hosting") {
     el.roleInfo.textContent = "Rolle: Host";
-    el.roleInfo.title =
-      "Datei wählen ✓ · Original speichern ✓ · Gäste zulassen/ablehnen ✓";
+    el.roleInfo.title = "Geteilte Datei wählen ✓ · Original speichern ✓ · Gäste zulassen/ablehnen ✓ · eigene Tabs ✓";
   } else if (mode === "joined") {
     el.roleInfo.textContent = "Rolle: Gast";
     el.roleInfo.title =
-      "Mittippen ✓ · Kopie speichern ✓ · Datei wählen ✗ (macht der Host) · Original speichern ✗";
+      "Mittippen ✓ · Kopie speichern ✓ · eigene Tabs öffnen ✓ · geteilte Datei wählen ✗ (macht der Host)";
   } else {
     el.roleInfo.textContent = "";
     el.roleInfo.title = "";
   }
   updateSaveButton();
   renderLanList();
+  updateTabBar();
 }
 
-// Code in die Zwischenablage; Fallback: ins Join-Feld legen zum manuellen Kopieren
+function updateSaveButton() {
+  el.save.textContent =
+    active === sessionTab && mode === "joined" && !active.path ? "Kopie speichern" : "Speichern";
+}
+
 function copyCode(code: string, label: string) {
   void navigator.clipboard.writeText(code).then(
     () => status(`${label} kopiert — per Messenger an die Gegenseite senden`),
@@ -308,10 +475,8 @@ function copyCode(code: string, label: string) {
   );
 }
 
-// --- Transport-Brücke: Bytes rein/raus über Tauri; der Kanal dahinter ist austauschbar
-// (M2: TCP, M3: WebRTC-DataChannel). Das Protokoll-Framing hier bleibt identisch.
+// --- Transport-Brücke (Bytes; Kanal dahinter: TCP oder WebRTC) ---
 
-// Roh-Senden für den Beitritts-Handshake (läuft VOR der Autorisierung)
 function rawSend(payload: Uint8Array) {
   if (!connected) return;
   void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
@@ -329,8 +494,107 @@ function sendControl(type: number, data: { id: string; name: string } | null) {
   rawSend(encoding.toUint8Array(enc));
 }
 
-function currentName(): string {
-  return el.nameInput.value.trim() || `Autor-${ydoc.clientID % 1000}`;
+function sendHandshake() {
+  const t = sessionTab;
+  if (!t) return;
+  if (mode === "hosting") {
+    const encMeta = encoding.createEncoder();
+    encoding.writeVarUint(encMeta, MSG_META);
+    encoding.writeVarString(encMeta, t.ydoc.guid);
+    sendBytes(encoding.toUint8Array(encMeta));
+  }
+  const enc = encoding.createEncoder();
+  encoding.writeVarUint(enc, MSG_SYNC);
+  syncProtocol.writeSyncStep1(enc, t.ydoc);
+  sendBytes(encoding.toUint8Array(enc));
+  const enc2 = encoding.createEncoder();
+  encoding.writeVarUint(enc2, MSG_AWARENESS);
+  encoding.writeVarUint8Array(
+    enc2,
+    awarenessProtocol.encodeAwarenessUpdate(t.awareness, [t.ydoc.clientID]),
+  );
+  sendBytes(encoding.toUint8Array(enc2));
+}
+
+function acceptPeer(peer: { id: string; name: string }) {
+  if (peer.id) rememberPeer(peer.id, peer.name);
+  pendingHello = null;
+  el.joinBanner.hidden = true;
+  authorized = true;
+  connStatus("verbunden");
+  sendControl(MSG_WELCOME, null);
+  sendHandshake();
+}
+
+function rejectPeer() {
+  pendingHello = null;
+  el.joinBanner.hidden = true;
+  sendControl(MSG_REJECT, null);
+  status("Beitritt abgelehnt — Verbindung wird getrennt");
+}
+
+function handleIncoming(data: Uint8Array) {
+  const t = sessionTab;
+  const dec = decoding.createDecoder(data);
+  const type = decoding.readVarUint(dec);
+  if (type === MSG_SYNC) {
+    if (!t) return;
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MSG_SYNC);
+    const msgType = syncProtocol.readSyncMessage(dec, enc, t.ydoc, "remote");
+    if (encoding.length(enc) > 1) sendBytes(encoding.toUint8Array(enc));
+    if (guestBaselinePending && msgType === syncProtocol.messageYjsSyncStep2) {
+      guestBaselinePending = false;
+      captureBaseline(t.ydoc);
+      refreshAuthorUi();
+    }
+  } else if (type === MSG_AWARENESS) {
+    if (!t) return;
+    awarenessProtocol.applyAwarenessUpdate(t.awareness, decoding.readVarUint8Array(dec), "remote");
+  } else if (type === MSG_PING) {
+    return;
+  } else if (type === MSG_HELLO) {
+    if (mode !== "hosting") return;
+    let hello: { id?: string; name?: string };
+    try {
+      hello = JSON.parse(decoding.readVarString(dec)) as { id?: string; name?: string };
+    } catch {
+      return;
+    }
+    const peer = { id: hello.id ?? "", name: (hello.name ?? "Unbekannt").slice(0, 24) };
+    if (peer.id && knownPeers()[peer.id]) {
+      acceptPeer(peer);
+      status(`${peer.name} (bekannt) beigetreten`);
+    } else {
+      pendingHello = peer;
+      el.jrText.textContent = `„${peer.name}" möchte der Session beitreten.`;
+      el.joinBanner.hidden = false;
+    }
+  } else if (type === MSG_WELCOME) {
+    if (mode !== "joined") return;
+    authorized = true;
+    sendHandshake();
+    status("Beitritt bestätigt");
+  } else if (type === MSG_REJECT) {
+    if (mode !== "joined") return;
+    status("Der Host hat den Beitritt abgelehnt", true);
+    void leaveSession();
+  } else if (type === MSG_META) {
+    if (mode !== "joined" || !t) return;
+    const guid = decoding.readVarString(dec);
+    if (hostGuid === null) {
+      hostGuid = guid;
+    } else if (hostGuid !== guid) {
+      // Host teilt ein ANDERES Dokument: Merge wäre Historien-Mix — frisch adoptieren
+      hostGuid = guid;
+      replaceDoc(t, "");
+      t.path = null;
+      guestBaselinePending = true;
+      updateFileLabel();
+      sendHandshake();
+      status("Host teilt ein neues Dokument — Stand übernommen");
+    }
+  }
 }
 
 // --- Heartbeat + Auto-Reconnect ---
@@ -358,9 +622,6 @@ function cancelRejoin() {
   rejoinAttempt = 0;
 }
 
-// Gast (TCP): automatische Wiederverbindung mit Backoff — der verlustfreie
-// Merge übernimmt danach (geteilte Historie). Internet-Codes sind Einmal-
-// Material, dort gibt es keinen Auto-Rejoin.
 function scheduleRejoin() {
   if (mode !== "joined" || !lastJoinedAddr || lastJoinedAddr.startsWith(CODE_PREFIX)) return;
   if (rejoinAttempt >= REJOIN_MAX) {
@@ -385,7 +646,6 @@ function handleStale() {
     void invoke("leave_session").catch(() => {});
     scheduleRejoin();
   } else if (mode === "hosting" && hostTransport === "tcp") {
-    // Re-Host räumt den toten Peer ab und lauscht wieder (inkl. mDNS-Ansage)
     void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId })
       .then(() => connStatus("wartet auf Peer …"))
       .catch((e) => status(String(e), true));
@@ -395,182 +655,9 @@ function handleStale() {
   updateSessionUi();
 }
 
-function sendHandshake() {
-  if (mode === "hosting") {
-    const encMeta = encoding.createEncoder();
-    encoding.writeVarUint(encMeta, MSG_META);
-    encoding.writeVarString(encMeta, ydoc.guid);
-    sendBytes(encoding.toUint8Array(encMeta));
-  }
-
-  const enc = encoding.createEncoder();
-  encoding.writeVarUint(enc, MSG_SYNC);
-  syncProtocol.writeSyncStep1(enc, ydoc);
-  sendBytes(encoding.toUint8Array(enc));
-
-  const enc2 = encoding.createEncoder();
-  encoding.writeVarUint(enc2, MSG_AWARENESS);
-  encoding.writeVarUint8Array(
-    enc2,
-    awarenessProtocol.encodeAwarenessUpdate(awareness, [ydoc.clientID]),
-  );
-  sendBytes(encoding.toUint8Array(enc2));
-}
-
-function wireDoc() {
-  if (wiredFor === ydoc) return;
-  wiredFor = ydoc;
-  ydoc.on("update", (update: Uint8Array, origin: unknown) => {
-    if (origin === "remote" || !connected) return;
-    const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MSG_SYNC);
-    syncProtocol.writeUpdate(enc, update);
-    sendBytes(encoding.toUint8Array(enc));
-  });
-  awareness.on(
-    "update",
-    (
-      changes: { added: number[]; updated: number[]; removed: number[] },
-      origin: unknown,
-    ) => {
-      if (origin === "remote" || !connected) return;
-      const changed = changes.added.concat(changes.updated, changes.removed);
-      const enc = encoding.createEncoder();
-      encoding.writeVarUint(enc, MSG_AWARENESS);
-      encoding.writeVarUint8Array(
-        enc,
-        awarenessProtocol.encodeAwarenessUpdate(awareness, changed),
-      );
-      sendBytes(encoding.toUint8Array(enc));
-    },
-  );
-}
-
-function handleIncoming(data: Uint8Array) {
-  const dec = decoding.createDecoder(data);
-  const type = decoding.readVarUint(dec);
-  if (type === MSG_SYNC) {
-    const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MSG_SYNC);
-    const msgType = syncProtocol.readSyncMessage(dec, enc, ydoc, "remote");
-    if (encoding.length(enc) > 1) sendBytes(encoding.toUint8Array(enc));
-    // Gast-Baseline: nach dem ersten vollständigen Host-Stand (SyncStep2) —
-    // ab hier zählt Getipptes als Session-Beitrag, alles davor als Bestand
-    if (
-      guestBaselinePending &&
-      msgType === syncProtocol.messageYjsSyncStep2
-    ) {
-      guestBaselinePending = false;
-      captureBaseline(ydoc);
-      refreshAuthorUi();
-    }
-  } else if (type === MSG_AWARENESS) {
-    awarenessProtocol.applyAwarenessUpdate(
-      awareness,
-      decoding.readVarUint8Array(dec),
-      "remote",
-    );
-  } else if (type === MSG_HELLO) {
-    if (mode !== "hosting") return;
-    let hello: { id?: string; name?: string };
-    try {
-      hello = JSON.parse(decoding.readVarString(dec)) as { id?: string; name?: string };
-    } catch {
-      return;
-    }
-    const peer = { id: hello.id ?? "", name: (hello.name ?? "Unbekannt").slice(0, 24) };
-    if (peer.id && knownPeers()[peer.id]) {
-      acceptPeer(peer);
-      status(`${peer.name} (bekannt) beigetreten`);
-    } else {
-      pendingHello = peer;
-      el.jrText.textContent = `„${peer.name}" möchte der Session beitreten.`;
-      el.joinBanner.hidden = false;
-    }
-  } else if (type === MSG_WELCOME) {
-    if (mode !== "joined") return;
-    authorized = true;
-    sendHandshake();
-    status("Beitritt bestätigt");
-  } else if (type === MSG_REJECT) {
-    if (mode !== "joined") return;
-    status("Der Host hat den Beitritt abgelehnt", true);
-    void leaveSession();
-  } else if (type === MSG_PING) {
-    return; // Empfang selbst ist das Lebenszeichen (lastRecv im Listener)
-  } else if (type === MSG_META) {
-    const guid = decoding.readVarString(dec);
-    if (mode !== "joined") return;
-    if (hostGuid === null) {
-      hostGuid = guid;
-    } else if (hostGuid !== guid) {
-      // Host teilt inzwischen ein ANDERES Dokument: Merge wäre Historien-Mix
-      // (Verdopplungs-Anti-Pattern) — Gast adoptiert stattdessen frisch.
-      hostGuid = guid;
-      resetDoc("");
-      currentPath = null;
-      guestBaselinePending = true;
-      el.fileLabel.textContent = "(Session-Dokument)";
-      wireDoc();
-      sendHandshake();
-      status("Host teilt ein neues Dokument — Stand übernommen");
-    }
-  }
-}
-
-function clearRemoteAwareness() {
-  const remote = [...awareness.getStates().keys()].filter(
-    (id) => id !== ydoc.clientID,
-  );
-  if (remote.length > 0) {
-    awarenessProtocol.removeAwarenessStates(awareness, remote, "remote");
-  }
-}
-
-// --- Editor ---
-
-function mountEditor() {
-  view?.destroy();
-  awareness.setLocalStateField("user", localUser());
-  const state = EditorState.create({
-    doc: ytext.toString(),
-    extensions: [
-      keymap.of(yUndoManagerKeymap),
-      basicSetup,
-      markdown(),
-      EditorView.lineWrapping,
-      yCollab(ytext, awareness, { undoManager }),
-      authorColoring(() => ytext),
-    ],
-  });
-  view = new EditorView({ state, parent: el.editor });
-}
-
-function resetDoc(contents: string) {
-  // Frischer Doc: kein Merge mit Vorzustand, daher kein Full-Replace-Anti-Pattern —
-  // es existiert keine geteilte Historie mit dem neuen Doc.
-  awareness.destroy();
-  ydoc.destroy();
-  wiredFor = null;
-  authorNames.clear();
-  clearBaseline();
-  ydoc = new Y.Doc();
-  ytext = ydoc.getText("content");
-  if (contents.length > 0) ytext.insert(0, contents);
-  awareness = new Awareness(ydoc);
-  undoManager = new Y.UndoManager(ytext);
-  registerDocObservers();
-  mountEditor();
-  updateLegend();
-}
-
 // --- Datei ---
 
 async function openFile() {
-  if (mode === "joined") {
-    status("Als Gast nicht möglich — die Datei wählt der Host", true);
-    return;
-  }
   const path = await open({
     multiple: false,
     filters: [
@@ -584,27 +671,37 @@ async function openFile() {
   if (typeof path !== "string") return;
   try {
     const contents = await invoke<string>("read_file", { path });
-    resetDoc(contents);
-    currentPath = path;
-    el.fileLabel.textContent = path;
-    if (mode === "hosting") {
-      // Host wechselt die geteilte Datei mitten in der Session: neue Baseline,
-      // Gäste schwenken über den Doc-GUID-Handshake (MSG_META) automatisch um
-      wireDoc();
-      captureBaseline(ydoc);
+    if (mode === "hosting" && active === sessionTab) {
+      // Host wechselt die geteilte Datei: Umschwenk via GUID-Handshake
+      replaceDoc(sessionTab, contents);
+      sessionTab.path = path;
+      captureBaseline(sessionTab.ydoc);
       refreshAuthorUi();
       if (connected) sendHandshake();
       status("Geöffnet — wird in der Session geteilt");
     } else {
+      // sonst: neuer Tab (leerer pfadloser aktiver Tab wird wiederverwendet)
+      let tab: Tab;
+      if (active.path === null && active.ytext.length === 0 && active !== sessionTab) {
+        tab = active;
+        replaceDoc(tab, contents);
+        tab.path = path;
+      } else {
+        tab = createTab(contents, path);
+      }
+      switchTab(tab);
       status("Geöffnet");
     }
+    updateFileLabel();
+    updateTabBar();
   } catch (e) {
     status(String(e), true);
   }
 }
 
 async function saveFile() {
-  let path = currentPath;
+  const tab = active;
+  let path = tab.path;
   if (!path) {
     const chosen = await save({
       filters: [
@@ -616,28 +713,24 @@ async function saveFile() {
     path = chosen;
   }
   try {
-    await invoke("write_file", { path, contents: ytext.toString() });
-    currentPath = path;
-    el.fileLabel.textContent = path;
+    await invoke("write_file", { path, contents: tab.ytext.toString() });
+    tab.path = path;
+    updateFileLabel();
+    updateTabBar();
     status("Gespeichert");
     updateSaveButton();
-    // Crash-Kopie ist ab jetzt überholt — leeren, damit kein stale Hinweis kommt
-    if (recoveryPath) void invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
+    if (recoveryPath && tab === sessionTab) {
+      void invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
+    }
   } catch (e) {
     status(String(e), true);
   }
-}
-
-// Gast ohne Pfad speichert eine lokale Kopie — Button-Beschriftung sagt das ehrlich
-function updateSaveButton() {
-  el.save.textContent = currentPath === null && mode === "joined" ? "Kopie speichern" : "Speichern";
 }
 
 // --- Session ---
 
 async function hostSession() {
   if (mode !== "idle") {
-    // Fungiert in hosting- UND joined-Modus als "Session beenden"/"Verlassen"
     await leaveSession();
     return;
   }
@@ -649,21 +742,43 @@ async function hostSession() {
     });
     mode = "hosting";
     hostTransport = "tcp";
-    wireDoc();
-    // Session-Baseline: der vorgeladene Datei-Inhalt ist Bestand, kein Autoren-Text
-    captureBaseline(ydoc);
+    sessionTab = active;
+    authorNames.clear();
+    captureBaseline(sessionTab.ydoc);
     refreshAuthorUi();
     el.sessionCode.textContent = code;
     el.sessionCode.title = "Klick: Code kopieren";
     updateSessionUi();
-    status("Code an die Gegenseite geben");
+    status("Code an die Gegenseite geben — im LAN erscheint die Session automatisch");
+  } catch (e) {
+    status(String(e), true);
+  }
+}
+
+async function hostInternet() {
+  if (mode !== "idle") {
+    status("Erst die aktuelle Session beenden", true);
+    return;
+  }
+  try {
+    status("Erzeuge Internet-Code … (STUN-Abfrage, wenige Sekunden)");
+    const code = await invoke<string>("webrtc_offer");
+    mode = "hosting";
+    hostTransport = "inet";
+    inetAwaitingAnswer = true;
+    sessionTab = active;
+    authorNames.clear();
+    captureBaseline(sessionTab.ydoc);
+    refreshAuthorUi();
+    updateSessionUi();
+    connStatus("warte auf Antwort-Code …");
+    copyCode(code, "Internet-Code");
   } catch (e) {
     status(String(e), true);
   }
 }
 
 async function joinSession() {
-  // Host-Seite einer Internet-Session: Eingabe ist der Antwort-Code des Gasts
   if (mode === "hosting" && inetAwaitingAnswer) {
     const answer = el.joinInput.value.trim();
     if (!answer.startsWith(CODE_PREFIX)) {
@@ -686,15 +801,15 @@ async function joinSession() {
   const rejoin = mode === "joined" && !connected;
   const addr = rejoin ? lastJoinedAddr! : el.joinInput.value.trim();
 
-  // Internet-Gast: QL1-Offer-Code statt ip:port
   if (!rejoin && addr.startsWith(CODE_PREFIX)) {
-    resetDoc("");
-    currentPath = null;
+    const tab = createTab("", null);
+    sessionTab = tab;
+    switchTab(tab);
     hostGuid = null;
     guestBaselinePending = true;
-    el.fileLabel.textContent = "(Session-Dokument)";
+    authorNames.clear();
     mode = "joined";
-    wireDoc();
+    updateFileLabel();
     updateSessionUi();
     try {
       status("Erzeuge Antwort-Code … (STUN-Abfrage, wenige Sekunden)");
@@ -705,6 +820,7 @@ async function joinSession() {
       connStatus("warte auf Host …");
     } catch (e) {
       mode = "idle";
+      sessionTab = null;
       updateSessionUi();
       status(String(e), true);
     }
@@ -720,16 +836,14 @@ async function joinSession() {
     return;
   }
   if (!rejoin) {
-    // Erst-Beitritt: Gast adoptiert den Host-State — eigener Doc wird leer,
-    // der Sync zieht den Inhalt. Beim Re-Join derselben Session dagegen KEIN
-    // Reset: geteilte Historie existiert, Offline-Edits mergen verlustfrei.
-    resetDoc("");
-    currentPath = null;
+    const tab = createTab("", null);
+    sessionTab = tab;
+    switchTab(tab);
     hostGuid = null;
     guestBaselinePending = true;
-    el.fileLabel.textContent = "(Session-Dokument)";
+    authorNames.clear();
     mode = "joined";
-    wireDoc();
+    updateFileLabel();
   }
   updateSessionUi();
   try {
@@ -738,31 +852,13 @@ async function joinSession() {
   } catch (e) {
     if (!rejoin) {
       mode = "idle";
+      sessionTab = null;
       status(String(e), true);
     } else {
-      // Fehlversuch in der Auto-Reconnect-Kette: nächsten Versuch einplanen
       scheduleRejoin();
     }
     updateSessionUi();
   }
-}
-
-// Host bestätigt einen Beitritt: Identität merken (TOFU), dann erst Sync starten
-function acceptPeer(peer: { id: string; name: string }) {
-  if (peer.id) rememberPeer(peer.id, peer.name);
-  pendingHello = null;
-  el.joinBanner.hidden = true;
-  authorized = true;
-  connStatus("verbunden");
-  sendControl(MSG_WELCOME, null);
-  sendHandshake();
-}
-
-function rejectPeer() {
-  pendingHello = null;
-  el.joinBanner.hidden = true;
-  sendControl(MSG_REJECT, null);
-  status("Beitritt abgelehnt — Verbindung wird getrennt");
 }
 
 async function leaveSession() {
@@ -779,12 +875,32 @@ async function leaveSession() {
   lastJoinedAddr = null;
   guestBaselinePending = false;
   inetAwaitingAnswer = false;
-  // Baseline bleibt: die Session-Färbung („wer hat was geschrieben") überlebt
-  // das Session-Ende, bis eine Datei neu geöffnet wird.
   clearRemoteAwareness();
+  sessionTab = null; // Tab bleibt als normaler Tab bestehen (Kopie beim Gast)
+  updateFileLabel();
   updateSessionUi();
   connStatus("offline");
   status("");
+}
+
+// --- LAN-Discovery ---
+
+const lanHosts = new Map<string, { label: string; addr: string; id: string }>();
+
+function renderLanList() {
+  el.lanList.innerHTML = "";
+  if (mode !== "idle") return;
+  for (const [, h] of lanHosts) {
+    const chip = document.createElement("button");
+    chip.className = "lan-chip";
+    chip.textContent = `⌂ ${h.label}`;
+    chip.title = `LAN-Session beitreten (${h.addr})`;
+    chip.addEventListener("click", () => {
+      el.joinInput.value = h.addr;
+      void joinSession();
+    });
+    el.lanList.appendChild(chip);
+  }
 }
 
 // --- Events vom Backend ---
@@ -794,13 +910,10 @@ void listen<number[]>("net-recv", (e) => {
   handleIncoming(Uint8Array.from(e.payload));
 });
 
-void listen<{ fullname: string; label: string; addr: string; id: string }>(
-  "lan-found",
-  (e) => {
-    lanHosts.set(e.payload.fullname, e.payload);
-    renderLanList();
-  },
-);
+void listen<{ fullname: string; label: string; addr: string; id: string }>("lan-found", (e) => {
+  lanHosts.set(e.payload.fullname, e.payload);
+  renderLanList();
+});
 void listen<string>("lan-removed", (e) => {
   lanHosts.delete(e.payload);
   renderLanList();
@@ -846,59 +959,81 @@ void listen<string>("net-status", (e) => {
 
 // --- UI-Verkabelung ---
 
-// Internet-Session (Host): Offer-Code erzeugen und teilen
-async function hostInternet() {
-  if (mode !== "idle") {
-    status("Erst die aktuelle Session beenden", true);
-    return;
-  }
-  try {
-    status("Erzeuge Internet-Code … (STUN-Abfrage, wenige Sekunden)");
-    const code = await invoke<string>("webrtc_offer");
-    mode = "hosting";
-    hostTransport = "inet";
-    inetAwaitingAnswer = true;
-    wireDoc();
-    captureBaseline(ydoc);
-    refreshAuthorUi();
-    updateSessionUi();
-    connStatus("warte auf Antwort-Code …");
-    copyCode(code, "Internet-Code");
-  } catch (e) {
-    status(String(e), true);
-  }
-}
-
 el.open.addEventListener("click", openFile);
 el.save.addEventListener("click", saveFile);
 el.host.addEventListener("click", hostSession);
 el.inet.addEventListener("click", hostInternet);
 el.join.addEventListener("click", joinSession);
+el.newTab.addEventListener("click", () => switchTab(createTab("", null)));
+el.sessionCode.addEventListener("click", () => {
+  const code = el.sessionCode.textContent;
+  if (code) copyCode(code, "Code");
+});
 el.colorsToggle.addEventListener("click", () => {
   const on = toggleColoring();
   el.colorsToggle.textContent = on ? "Farben aus" : "Farben an";
   refreshAuthorUi();
 });
-// Name fensterlokal (sessionStorage) — der geteilte localStorage dient nur als
-// Vorbelegung, sonst überschreiben sich zwei Fenster auf einem Rechner gegenseitig
 el.nameInput.value =
   sessionStorage.getItem(NAME_STORAGE_KEY) ?? localStorage.getItem(NAME_STORAGE_KEY) ?? "";
 el.nameInput.addEventListener("change", () => {
   const v = el.nameInput.value.trim();
   sessionStorage.setItem(NAME_STORAGE_KEY, v);
   localStorage.setItem(NAME_STORAGE_KEY, v);
-  awareness.setLocalStateField("user", localUser());
+  active.awareness.setLocalStateField("user", localUser(active));
+  if (sessionTab && sessionTab !== active) {
+    sessionTab.awareness.setLocalStateField("user", localUser(sessionTab));
+  }
   updateLegend();
 });
-el.sessionCode.addEventListener("click", () => {
-  const code = el.sessionCode.textContent;
-  if (code) {
-    void navigator.clipboard.writeText(code).then(
-      () => status("Code kopiert"),
-      () => status("Kopieren fehlgeschlagen — Code manuell abtippen", true),
-    );
+el.jrAccept.addEventListener("click", () => {
+  if (pendingHello) acceptPeer(pendingHello);
+});
+el.jrReject.addEventListener("click", rejectPeer);
+
+let recoverArmed = false;
+el.recover.addEventListener("click", async () => {
+  if (!recoveryPath) return;
+  if ((active.path !== null || active.ytext.length > 0) && mode === "hosting" && active === sessionTab && !recoverArmed) {
+    recoverArmed = true;
+    el.recover.textContent = "Wirklich ersetzen?";
+    status("Ersetzt das geteilte Dokument — zum Bestätigen erneut klicken", true);
+    return;
+  }
+  try {
+    const contents = await invoke<string>("read_file", { path: recoveryPath });
+    recoverArmed = false;
+    el.recover.textContent = "Wiederherstellen";
+    el.recoveryBanner.hidden = true;
+    if (mode === "hosting" && active === sessionTab) {
+      replaceDoc(sessionTab, contents);
+      sessionTab.path = null;
+      captureBaseline(sessionTab.ydoc);
+      refreshAuthorUi();
+      if (connected) sendHandshake();
+      status("Crash-Kopie wiederhergestellt — wird in der Session geteilt");
+    } else {
+      const tab = createTab(contents, null);
+      switchTab(tab);
+      if (mode === "idle") {
+        await hostSession();
+        status("Crash-Kopie wiederhergestellt — Session läuft, Gäste können beitreten");
+      } else {
+        status("Crash-Kopie in neuem Tab wiederhergestellt");
+      }
+    }
+    updateFileLabel();
+  } catch (e) {
+    status(String(e), true);
   }
 });
+el.recoverDismiss.addEventListener("click", () => {
+  if (recoveryPath) {
+    void invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
+  }
+  el.recoveryBanner.hidden = true;
+});
+
 window.addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key === "s") {
     e.preventDefault();
@@ -906,9 +1041,6 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// Einfüge-Automatik: QL1-Code irgendwo im Fenster einfügen (Strg+V) genügt —
-// die App erkennt ihn und tut das Richtige (beitreten bzw. Antwort verbinden).
-// Nicht im Editor abfangen: dort könnte man einen Code auch als TEXT einfügen wollen.
 window.addEventListener("paste", (e) => {
   const target = e.target as HTMLElement | null;
   if (target && el.editor.contains(target)) return;
@@ -916,8 +1048,7 @@ window.addEventListener("paste", (e) => {
   if (!text.startsWith(CODE_PREFIX)) return;
   e.preventDefault();
   el.joinInput.value = text;
-  const canAct =
-    mode === "idle" || (mode === "hosting" && inetAwaitingAnswer);
+  const canAct = mode === "idle" || (mode === "hosting" && inetAwaitingAnswer);
   if (canAct) {
     status("Code erkannt — verbinde …");
     void joinSession();
@@ -926,66 +1057,13 @@ window.addEventListener("paste", (e) => {
   }
 });
 
+// --- Start ---
+
+active = createTab("", null);
+updateFileLabel();
 updateSessionUi();
-registerDocObservers();
 mountEditor();
 
-// Recovery-Pfad ermitteln; bei vorhandener Crash-Kopie Banner mit
-// Wiederherstellen/Verwerfen zeigen (Realtest-Fund: Pfad-Suchen klappt nie)
-async function clearRecovery() {
-  if (recoveryPath) {
-    await invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
-  }
-  el.recoveryBanner.hidden = true;
-}
-
-let recoverArmed = false;
-el.recover.addEventListener("click", async () => {
-  if (!recoveryPath) return;
-  if (mode === "joined") {
-    status("Als Gast nicht möglich — erst Session verlassen", true);
-    return;
-  }
-  // Doppelklick-Schutz statt Blockade: bestehender Inhalt wird erst nach
-  // erneutem Klick ersetzt (kein stiller Verlust des offenen Dokuments)
-  if ((currentPath !== null || ytext.length > 0) && !recoverArmed) {
-    recoverArmed = true;
-    el.recover.textContent = "Wirklich ersetzen?";
-    status("Ersetzt den aktuellen Inhalt — zum Bestätigen erneut klicken", true);
-    return;
-  }
-  try {
-    const contents = await invoke<string>("read_file", { path: recoveryPath });
-    resetDoc(contents);
-    currentPath = null;
-    el.fileLabel.textContent = "(Wiederhergestellte Crash-Kopie — bitte speichern)";
-    el.recoveryBanner.hidden = true;
-    recoverArmed = false;
-    el.recover.textContent = "Wiederherstellen";
-    if (mode === "hosting") {
-      // wie beim Datei-Wechsel: neue Baseline, Gäste schwenken via GUID um
-      wireDoc();
-      captureBaseline(ydoc);
-      refreshAuthorUi();
-      if (connected) sendHandshake();
-      status("Crash-Kopie wiederhergestellt — wird in der Session geteilt");
-    } else {
-      // Wiederherstellen heißt „weitermachen": direkt wieder als Host anbieten
-      await hostSession();
-      status("Crash-Kopie wiederhergestellt — Session läuft, Gäste können beitreten");
-    }
-  } catch (e) {
-    status(String(e), true);
-  }
-});
-
-el.recoverDismiss.addEventListener("click", () => void clearRecovery());
-el.jrAccept.addEventListener("click", () => {
-  if (pendingHello) acceptPeer(pendingHello);
-});
-el.jrReject.addEventListener("click", rejectPeer);
-
-// mDNS-Discovery aktivieren (best effort — ohne sie fehlt nur die LAN-Liste)
 void invoke("lan_init").catch(() => {});
 
 void invoke<string>("recovery_file_path")

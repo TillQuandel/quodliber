@@ -85,6 +85,58 @@ body,
   max-width: 40%;
 }
 
+#tabbar {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.3rem 0.5rem 0;
+  border-bottom: 1px solid light-dark(#ddd, #333);
+  overflow-x: auto;
+}
+
+#tabbar .tab {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid light-dark(#ddd, #333);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: light-dark(#f0f0f0, #222);
+  color: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#tabbar .tab.active {
+  background: light-dark(#fff, #1a1a1a);
+  font-weight: 600;
+}
+
+#tabbar .tab.shared {
+  border-color: light-dark(#7db8e8, #3a5a78);
+}
+
+#tabbar .tab-close {
+  opacity: 0.5;
+  padding: 0 0.15rem;
+}
+
+#tabbar .tab-close:hover {
+  opacity: 1;
+  color: light-dark(#c0392b, #e74c3c);
+}
+
+#btn-new-tab {
+  border: 1px dashed light-dark(#bbb, #555);
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: inherit;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+
 #recovery-banner,
 #join-banner {
   display: flex;
