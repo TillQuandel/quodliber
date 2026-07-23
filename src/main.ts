@@ -123,8 +123,10 @@ const lanHosts = new Map<string, { label: string; addr: string; id: string }>();
 function renderLanList() {
   el.lanList.innerHTML = "";
   if (mode !== "idle") return;
+  // Kein Selbst-Filter: nur Hosts senden Ansagen, und im Hosting-Modus ist die
+  // Liste ausgeblendet — ein Filter über die Install-Identität würde auf einem
+  // Rechner mit zwei Fenstern (geteilte localStorage) das Nachbarfenster verstecken.
   for (const [fullname, h] of lanHosts) {
-    if (h.id === myId) continue; // eigene Ansage nicht anbieten
     const chip = document.createElement("button");
     chip.className = "lan-chip";
     chip.textContent = `⌂ ${h.label}`;
