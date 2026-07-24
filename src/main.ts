@@ -618,14 +618,26 @@ function copyCode(code: string, label: string) {
 
 // --- Transport-Brücke (Bytes; Kanal dahinter: TCP oder WebRTC) ---
 
+/// Ein fehlgeschlagenes Senden hieß bisher: Update weg, UI zeigt weiter
+/// „verbunden". Der Kanal ist an dieser Stelle nachweislich tot (Rust meldet
+/// nur dann einen Fehler) — also Zustand korrigieren statt verschlucken.
+function reportSendFailure(e: unknown) {
+  qlog(`Sendefehler: ${String(e)}`);
+  if (connected) {
+    connected = false;
+    connStatus("Senden fehlgeschlagen — Verbindung prüfen");
+    updateSessionUi();
+  }
+}
+
 function rawSend(payload: Uint8Array) {
   if (!connected) return;
-  void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
+  void invoke("net_send", { data: Array.from(payload) }).catch(reportSendFailure);
 }
 
 function sendBytes(payload: Uint8Array) {
   if (!connected || !authorized) return;
-  void invoke("net_send", { data: Array.from(payload) }).catch(() => {});
+  void invoke("net_send", { data: Array.from(payload) }).catch(reportSendFailure);
 }
 
 function sendControl(type: number, data: { id: string; name: string } | null) {
@@ -693,9 +705,16 @@ function handleIncoming(data: Uint8Array) {
     if (!t) return;
     const enc = encoding.createEncoder();
     encoding.writeVarUint(enc, MSG_SYNC);
-    const msgType = syncProtocol.readSyncMessage(dec, enc, t.ydoc, "remote");
+    // y-protocols fängt Update-Fehler intern ab und meldet sie nur an die
+    // Konsole — ohne diesen Handler bliebe ein fehlgeschlagener Sync unsichtbar
+    // und die Autoren-Baseline würde auf einem unvollständigen Doc einfrieren
+    let syncFailed = false;
+    const msgType = syncProtocol.readSyncMessage(dec, enc, t.ydoc, "remote", (err) => {
+      syncFailed = true;
+      qlog(`Sync-Fehler: ${String(err)}`);
+    });
     if (encoding.length(enc) > 1) sendBytes(encoding.toUint8Array(enc));
-    if (guestBaselinePending && msgType === syncProtocol.messageYjsSyncStep2) {
+    if (guestBaselinePending && !syncFailed && msgType === syncProtocol.messageYjsSyncStep2) {
       guestBaselinePending = false;
       captureBaseline(t.ydoc);
       refreshAuthorUi();
@@ -733,7 +752,11 @@ function handleIncoming(data: Uint8Array) {
     }
     let hello: { id?: string; name?: string };
     try {
-      hello = JSON.parse(decoding.readVarString(dec)) as { id?: string; name?: string };
+      const raw = decoding.readVarString(dec);
+      // Vorstellung ist ein winziges JSON-Objekt; alles Größere ist Unfug
+      // (der Frame darf bis MAX_FRAME groß sein — das nicht zu parsen versuchen)
+      if (raw.length > 1024) return;
+      hello = JSON.parse(raw) as { id?: string; name?: string };
     } catch {
       return;
     }
@@ -1022,6 +1045,7 @@ async function joinSession() {
     } catch (e) {
       mode = "idle";
       sessionTab = null;
+      closeTab(tab); // sonst bleibt nach jedem Fehlversuch ein leerer Tab stehen
       updateSessionUi();
       status(String(e), true);
     }
@@ -1052,8 +1076,10 @@ async function joinSession() {
     lastJoinedAddr = addr;
   } catch (e) {
     if (!rejoin) {
+      const stale = sessionTab;
       mode = "idle";
       sessionTab = null;
+      if (stale) closeTab(stale); // kein verwaister Tab nach Fehlversuch
       status(String(e), true);
     } else {
       scheduleRejoin();
@@ -1111,7 +1137,14 @@ function renderLanList() {
 
 void listen<number[]>("net-recv", (e) => {
   lastRecv = Date.now();
-  handleIncoming(Uint8Array.from(e.payload));
+  try {
+    handleIncoming(Uint8Array.from(e.payload));
+  } catch (err) {
+    // Abgeschnittene oder mutwillig fehlerhafte Frames werfen in den lib0-
+    // Decodern; ohne diesen Fang verließe der Fehler den Event-Callback und
+    // die Session liefe stumm weiter, obwohl sie nicht mehr synchron ist
+    qlog(`Nachricht nicht verarbeitbar (verworfen): ${String(err)}`);
+  }
 });
 
 void listen<{ fullname: string; label: string; addr: string; id: string }>("lan-found", (e) => {
