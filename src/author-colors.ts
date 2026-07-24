@@ -1,11 +1,9 @@
 import { StateEffect } from "@codemirror/state";
-import {
-  Decoration,
-  DecorationSet,
-  EditorView,
-  ViewPlugin,
-  ViewUpdate,
-} from "@codemirror/view";
+// Typen getrennt importieren: sonst kann Node sie beim Type-Stripping nicht
+// entfernen und der Import scheitert — tools/test-author-runs.mjs lädt dieses
+// Modul direkt, statt seine Logik nachzubauen.
+import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
+import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import * as Y from "yjs";
 
 // Deterministische Autoren-Palette: Farbe = clientID % 8 — beide Seiten rechnen

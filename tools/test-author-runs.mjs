@@ -1,30 +1,16 @@
 // Erdungstest für src/author-colors.ts §authorRuns: Der Walker liest das interne
-// Yjs-Feld `_start` — hier wird dieselbe Logik gegen die echte yjs-Lib geprüft:
+// Yjs-Feld `_start` — hier wird die ECHTE Funktion gegen die echte yjs-Lib
+// geprüft (direkter Modul-Import, keine Nachbildung; sonst würde der Test nur
+// seine eigene Kopie absichern und Änderungen am Produktionscode nicht bemerken):
 // zwei Clients editieren verschränkt (inkl. Löschungen), dann muss die
 // Run-Attribution exakt Text und Autoren-Zeichenzahlen reproduzieren.
 import * as Y from "yjs";
 import assert from "node:assert/strict";
+import { authorRuns, captureBaseline, clearBaseline, NEUTRAL } from "../src/author-colors.ts";
 
-function authorRuns(ytext) {
-  const runs = [];
-  let pos = 0;
-  let item = ytext._start;
-  while (item !== null) {
-    if (!item.deleted && item.countable) {
-      const client = item.id.client;
-      const len = item.length;
-      const last = runs[runs.length - 1];
-      if (last && last.client === client && last.to === pos) {
-        last.to = pos + len;
-      } else {
-        runs.push({ client, from: pos, to: pos + len });
-      }
-      pos += len;
-    }
-    item = item.right;
-  }
-  return runs;
-}
+// Erster Teil ohne Session-Baseline: reine Attribution über die Doc-Lebensdauer
+clearBaseline();
+const runsOf = (ytext) => authorRuns(ytext, false);
 
 const sync = (a, b) => {
   Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
@@ -48,7 +34,7 @@ sync(docA, docB);
 
 assert.equal(tA.toString(), tB.toString(), "Konvergenz");
 const text = tA.toString();
-const runs = authorRuns(tA);
+const runs = runsOf(tA);
 
 // 1. Runs decken den Text lückenlos und überlappungsfrei ab
 let pos = 0;
@@ -71,60 +57,34 @@ assert.equal(count.get(docB.clientID), expectB, "Zeichen von B");
 assert.equal(count.size, 2, "genau zwei Autoren");
 
 // 3. Beide Replikate attribuieren identisch
-const runsB = authorRuns(tB);
+const runsB = runsOf(tB);
 assert.deepEqual(runs, runsB, "Attribution replikenidentisch");
 
 console.log(`OK — ${runs.length} Runs, A=${expectA} Zeichen, B=${expectB} Zeichen, Text ${text.length} Zeichen`);
 
-// --- Baseline-Fall: Bestand vor Session-Start wird NEUTRAL (-1) attribuiert ---
-function authorRunsBaseline(ytext, baseline) {
-  const runs = [];
-  let pos = 0;
-  const push = (client, len) => {
-    const last = runs[runs.length - 1];
-    if (last && last.client === client && last.to === pos) last.to = pos + len;
-    else runs.push({ client, from: pos, to: pos + len });
-    pos += len;
-  };
-  let item = ytext._start;
-  while (item !== null) {
-    if (!item.deleted && item.countable) {
-      const client = item.id.client;
-      const len = item.length;
-      const blClock = baseline?.get(client) ?? 0;
-      if (!baseline || item.id.clock >= blClock) push(client, len);
-      else if (item.id.clock + len <= blClock) push(-1, len);
-      else {
-        // Item überspannt die Baseline (Yjs merged benachbarte Items!)
-        const neutralLen = blClock - item.id.clock;
-        push(-1, neutralLen);
-        push(client, len - neutralLen);
-      }
-    }
-    item = item.right;
-  }
-  return runs;
-}
-
+// --- Baseline-Fall: Bestand vor Session-Start wird NEUTRAL (-1) attribuiert.
+// Auch hier die echte Funktion samt echter captureBaseline() — der Split eines
+// die Baseline überspannenden Items ist genau die Stelle, die schon einmal
+// falsch war und die eine Nachbildung nicht absichern würde.
 const docC = new Y.Doc();
 const docD = new Y.Doc();
 const tC = docC.getText("content");
 const tD = docD.getText("content");
 tC.insert(0, "Bestand aus der Datei.");
 // Session-Start: Baseline VOR den Session-Edits einfrieren
-const bl = Y.decodeStateVector(Y.encodeStateVector(docC));
+captureBaseline(docC);
 sync(docC, docD);
 tC.insert(tC.length, " C-in-Session.");
 tD.insert(0, "D-in-Session: ");
 sync(docC, docD);
 
-const blRuns = authorRunsBaseline(tC, bl);
+const blRuns = authorRuns(tC, true);
 const neutralChars = blRuns
-  .filter((r) => r.client === -1)
+  .filter((r) => r.client === NEUTRAL)
   .reduce((n, r) => n + (r.to - r.from), 0);
 assert.equal(neutralChars, "Bestand aus der Datei.".length, "Bestand neutral");
 const sessionAuthors = new Set(
-  blRuns.filter((r) => r.client !== -1).map((r) => r.client),
+  blRuns.filter((r) => r.client !== NEUTRAL).map((r) => r.client),
 );
 assert.equal(sessionAuthors.size, 2, "beide Session-Autoren attribuiert");
 assert.ok(sessionAuthors.has(docC.clientID) && sessionAuthors.has(docD.clientID));
