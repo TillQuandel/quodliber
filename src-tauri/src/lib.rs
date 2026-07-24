@@ -120,6 +120,12 @@ struct LanHost {
     id: String,
 }
 
+/// Werte aus fremden mDNS-Ansagen sind unvalidierte Netzwerk-Eingaben (jedes
+/// Gerät im LAN darf sie setzen): Steuerzeichen raus, auf Anzeigelänge kürzen.
+fn clean_prop(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
 /// Einmal beim App-Start: mDNS-Daemon anlegen und dauerhaft nach Quodliber-
 /// Hosts im LAN browsen; Funde/Abgänge gehen als Events ans Frontend.
 #[tauri::command]
@@ -136,9 +142,17 @@ fn lan_init(app: AppHandle) -> Result<(), String> {
 
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Obergrenze, damit ein einzelnes Gerät die Beitritts-Liste des
+        // Nutzers nicht mit hunderten Ansagen fluten kann
+        const MAX_HOSTS: usize = 32;
+        let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Ok(event) = receiver.recv_async().await {
             match event {
                 mdns_sd::ServiceEvent::ServiceResolved(info) => {
+                    let fullname = info.get_fullname().to_string();
+                    if !announced.contains(&fullname) && announced.len() >= MAX_HOSTS {
+                        continue;
+                    }
                     let addr = info
                         .get_addresses()
                         .iter()
@@ -146,19 +160,23 @@ fn lan_init(app: AppHandle) -> Result<(), String> {
                         .or_else(|| info.get_addresses().iter().next())
                         .map(|a| format!("{}:{}", a, info.get_port()));
                     if let Some(addr) = addr {
+                        let label = clean_prop(info.get_property_val_str("name").unwrap_or(""), 40);
                         let host = LanHost {
-                            fullname: info.get_fullname().to_string(),
-                            label: info
-                                .get_property_val_str("name")
-                                .unwrap_or("Unbekannt")
-                                .to_string(),
+                            fullname: fullname.clone(),
+                            label: if label.trim().is_empty() {
+                                "Unbekannt".to_string()
+                            } else {
+                                label
+                            },
                             addr,
-                            id: info.get_property_val_str("id").unwrap_or("").to_string(),
+                            id: clean_prop(info.get_property_val_str("id").unwrap_or(""), 64),
                         };
+                        announced.insert(fullname);
                         let _ = app2.emit("lan-found", host);
                     }
                 }
                 mdns_sd::ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                    announced.remove(&fullname);
                     let _ = app2.emit("lan-removed", fullname);
                 }
                 _ => {}
@@ -171,10 +189,13 @@ fn lan_init(app: AppHandle) -> Result<(), String> {
 /// Beim Hosten: eigenen Service im LAN ansagen (best effort — Scheitern der
 /// Ansage verhindert die Session nicht, es fehlt dann nur der Listen-Eintrag).
 fn mdns_announce(app: &AppHandle, port: u16, name: &str, id: &str) {
+    // Zeichenweise kürzen: Byte-Slicing (`&id[..8]`) panickt an Nicht-ASCII-
+    // Grenzen, und ein Panic unter dem Lock vergiftet den mDNS-Mutex dauerhaft
+    let short_id: String = id.chars().take(8).collect();
+    let instance = format!("{}-{}", name.replace('.', "_"), short_id);
     let st = app.state::<NetState>();
     let guard = st.mdns.lock().unwrap();
     let Some(daemon) = guard.as_ref() else { return };
-    let instance = format!("{}-{}", name.replace('.', "_"), &id[..id.len().min(8)]);
     let props = [("name", name), ("id", id)];
     match mdns_sd::ServiceInfo::new(MDNS_SERVICE, &instance, &format!("{instance}.local."), "", port, &props[..])
         .map(|s| s.enable_addr_auto())
@@ -415,7 +436,6 @@ async fn host_session(
     id: String,
 ) -> Result<String, String> {
     leave_inner(&app);
-    mdns_announce(&app, port, &name, &id);
     // Kurzer Retry: der Task-Abort aus leave_inner gibt den Port asynchron frei —
     // direktes Re-Hosting auf demselben Port darf daran nicht scheitern.
     let listener = {
@@ -431,6 +451,9 @@ async fn host_session(
             }
         }
     };
+    // Erst ansagen, wenn der Port wirklich steht — sonst bewirbt ein
+    // gescheiterter Bind eine Session, die es gar nicht gibt
+    mdns_announce(&app, port, &name, &id);
     let ip = local_ip().unwrap_or_else(|| "127.0.0.1".into());
     emit_status(&app, "listening");
 

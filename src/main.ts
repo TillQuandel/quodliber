@@ -264,6 +264,9 @@ function registerTabObservers(tab: Tab) {
     syncProtocol.writeUpdate(enc, update);
     sendBytes(encoding.toUint8Array(enc));
   });
+  // Vor dem Cursor-Rendering: `change` feuert in y-protocols vor `update`, und
+  // dieser Handler wird vor dem von yCollab registriert (mountEditor läuft später)
+  tab.awareness.on("change", () => sanitizeRemoteAwareness(tab));
   tab.awareness.on(
     "update",
     (
@@ -455,6 +458,28 @@ function updateLegend() {
   }
 }
 
+const HEX_COLOR = /^#[0-9a-fA-F]{3,8}$/;
+
+/// Fremde Awareness-Werte sind rohe Eingaben der Gegenseite: y-codemirror.next
+/// setzt `user.color` ungeprüft in ein style-Attribut (CSS-Injection, z. B.
+/// bildschirmfüllendes Overlay), der Name landet in der Legende. Vor dem
+/// Rendern auf harmlose Werte zurechtstutzen — läuft am `change`-Event, das
+/// vor dem Cursor-Rendering von y-codemirror.next feuert.
+function sanitizeRemoteAwareness(tab: Tab) {
+  for (const [id, state] of tab.awareness.getStates()) {
+    if (id === tab.ydoc.clientID) continue;
+    const user = (state as { user?: { name?: unknown; color?: unknown; colorLight?: unknown } }).user;
+    if (!user) continue;
+    const pal = paletteFor(id);
+    if (typeof user.color !== "string" || !HEX_COLOR.test(user.color)) user.color = pal.color;
+    if (typeof user.colorLight !== "string" || !HEX_COLOR.test(user.colorLight)) {
+      user.colorLight = pal.light;
+    }
+    if (typeof user.name !== "string") user.name = `Autor-${id % 1000}`;
+    else if (user.name.length > 24) user.name = user.name.slice(0, 24);
+  }
+}
+
 function harvestAwarenessNames(tab: Tab) {
   if (tab !== sessionTab && tab !== active) return;
   for (const [id, state] of tab.awareness.getStates()) {
@@ -621,6 +646,14 @@ function handleIncoming(data: Uint8Array) {
   const t = sessionTab;
   const dec = decoding.createDecoder(data);
   const type = decoding.readVarUint(dec);
+  // Dokument-Nachrichten erst nach dem Beitritts-OK annehmen. Ohne diese
+  // Sperre schreibt jeder, der den Kanal erreicht, ins geteilte Dokument —
+  // ohne HELLO, ohne Bestätigung, und der Autosave trägt es in die Datei.
+  // Gilt in beide Richtungen: nach „Gast trennen" ist authorized wieder false.
+  if (!authorized && (type === MSG_SYNC || type === MSG_AWARENESS || type === MSG_META)) {
+    qlog(`Nachricht (Typ ${type}) vor/ohne Beitritts-Bestätigung verworfen`);
+    return;
+  }
   if (type === MSG_SYNC) {
     if (!t) return;
     const enc = encoding.createEncoder();
@@ -1179,6 +1212,12 @@ el.kick.addEventListener("click", () => {
   window.setTimeout(() => {
     if (connected && mode === "hosting" && hostTransport === "tcp") {
       void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId }).catch(() => {});
+    } else if (connected && mode === "hosting") {
+      // Internet-Session kennt kein Weiterlauschen: den Kanal hart kappen,
+      // sonst bliebe ein Gast, der das REJECT ignoriert, dauerhaft verbunden
+      void leaveSession().then(() =>
+        status(`${name} getrennt — Internet-Session beendet (für neue Gäste neuen Code erzeugen)`),
+      );
     }
   }, 2000);
 });
