@@ -25,6 +25,26 @@ struct NetState {
     // mDNS: ein Daemon pro App; registrierter Service-Name beim Hosten
     mdns: Mutex<Option<mdns_sd::ServiceDaemon>>,
     mdns_fullname: Mutex<Option<String>>,
+    // Zählt jede Session-Auflösung. WebRTC-Callbacks laufen in der Maschinerie
+    // von webrtc-rs und überleben `leave_inner` — sie müssen prüfen können, ob
+    // sie noch zur aktuellen Session gehören.
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+/// Gehört dieser Callback noch zur laufenden Session? Ohne diese Prüfung
+/// überschreibt eine alte, noch nicht geschlossene Verbindung den Sendekanal
+/// der neuen — Dokumentinhalt ginge dann an den falschen Peer.
+fn is_current(app: &AppHandle, epoch: u64) -> bool {
+    app.state::<NetState>()
+        .epoch
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == epoch
+}
+
+fn current_epoch(app: &AppHandle) -> u64 {
+    app.state::<NetState>()
+        .epoch
+        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn emit_status(app: &AppHandle, status: &str) {
@@ -88,6 +108,8 @@ fn attach_stream(app: &AppHandle, stream: TcpStream) {
 
 fn leave_inner(app: &AppHandle) {
     let st = app.state::<NetState>();
+    // Alles, was ab jetzt aus der alten Session zurückruft, ist überholt
+    st.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *st.outgoing.lock().unwrap() = None;
     for h in st.tasks.lock().unwrap().drain(..) {
         h.abort();
@@ -283,7 +305,7 @@ async fn new_pc(app: &AppHandle) -> Result<Arc<RTCPeerConnection>, String> {
 
 /// DataChannel an die bestehende Byte-Brücke hängen: gleiche net-recv/net-status-
 /// Events und derselbe outgoing-Kanal wie beim TCP-Transport.
-fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
+fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>, epoch: u64) {
     let recv_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let app_open = app.clone();
@@ -292,6 +314,11 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
         let app2 = app_open.clone();
         let dc2 = dc_open.clone();
         Box::pin(async move {
+            // Kanal einer bereits aufgelösten Session: nicht übernehmen
+            if !is_current(&app2, epoch) {
+                let _ = dc2.close().await;
+                return;
+            }
             let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
             *app2.state::<NetState>().outgoing.lock().unwrap() = Some(tx);
             emit_status(&app2, "connected");
@@ -312,10 +339,16 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
     }));
 
     let app_msg = app.clone();
+    let dc_msg = dc.clone();
     dc.on_message(Box::new(move |msg| {
         let app2 = app_msg.clone();
+        let dc2 = dc_msg.clone();
         let buf = recv_buf.clone();
         Box::pin(async move {
+            if !is_current(&app2, epoch) {
+                return;
+            }
+            let mut broken = false;
             let frames = {
                 let mut b = buf.lock().unwrap();
                 b.extend_from_slice(&msg.data);
@@ -327,6 +360,7 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
                     let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
                     if len > MAX_FRAME {
                         b.clear();
+                        broken = true;
                         break;
                     }
                     if b.len() < 4 + len {
@@ -340,6 +374,15 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
             for f in frames {
                 let _ = app2.emit("net-recv", f);
             }
+            if broken {
+                // Nach einem unmöglichen Längenprefix lässt sich der Strom nicht
+                // mehr resynchronisieren — Kanal beenden statt dauerhaft Müll zu
+                // parsen (der TCP-Pfad bricht an derselben Stelle die Verbindung ab)
+                let _ = app2.emit("net-log", "Ungültige Frame-Länge — Kanal beendet");
+                *app2.state::<NetState>().outgoing.lock().unwrap() = None;
+                emit_status(&app2, "disconnected");
+                let _ = dc2.close().await;
+            }
         })
     }));
 
@@ -347,6 +390,10 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
     dc.on_close(Box::new(move || {
         let app2 = app_close.clone();
         Box::pin(async move {
+            // Ein alter Kanal darf die laufende Session nicht für tot erklären
+            if !is_current(&app2, epoch) {
+                return;
+            }
             let st = app2.state::<NetState>();
             *st.outgoing.lock().unwrap() = None;
             emit_status(&app2, "disconnected");
@@ -354,17 +401,37 @@ fn wire_datachannel(app: &AppHandle, dc: Arc<RTCDataChannel>) {
     }));
 }
 
+/// PeerConnection sofort im State verankern und eine eventuell vorhandene
+/// schließen. Wird sie erst nach dem ICE-Gathering registriert, ist sie
+/// mehrere Sekunden lang für `leave_inner` unsichtbar — sie lebt dann nach
+/// einem Abbruch weiter und meldet später eine Verbindung, die niemand mehr
+/// erwartet.
+fn store_pc(app: &AppHandle, pc: Arc<RTCPeerConnection>) {
+    let old = {
+        let st = app.state::<NetState>();
+        let mut guard = st.pc.lock().unwrap();
+        guard.replace(pc)
+    };
+    if let Some(old) = old {
+        tauri::async_runtime::spawn(async move {
+            let _ = old.close().await;
+        });
+    }
+}
+
 /// Host: Offer-Code erzeugen (Vanilla-ICE — wartet auf Gathering-complete,
 /// der Code enthält damit alle Candidates für den Einmal-Austausch).
 #[tauri::command]
 async fn webrtc_offer(app: AppHandle) -> Result<String, String> {
     leave_inner(&app);
+    let epoch = current_epoch(&app);
     let pc = new_pc(&app).await?;
+    store_pc(&app, pc.clone());
     let dc = pc
         .create_data_channel("quodliber", None)
         .await
         .map_err(|e| e.to_string())?;
-    wire_datachannel(&app, dc);
+    wire_datachannel(&app, dc, epoch);
 
     let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
     let mut gather = pc.gathering_complete_promise().await;
@@ -377,7 +444,6 @@ async fn webrtc_offer(app: AppHandle) -> Result<String, String> {
         .await
         .ok_or("Kein Local-Description-Stand")?;
     let code = encode_desc(&desc)?;
-    *app.state::<NetState>().pc.lock().unwrap() = Some(pc);
     Ok(code)
 }
 
@@ -385,11 +451,13 @@ async fn webrtc_offer(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 async fn webrtc_accept(app: AppHandle, code: String) -> Result<String, String> {
     leave_inner(&app);
+    let epoch = current_epoch(&app);
     let pc = new_pc(&app).await?;
+    store_pc(&app, pc.clone());
 
     let app2 = app.clone();
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-        wire_datachannel(&app2, dc);
+        wire_datachannel(&app2, dc, epoch);
         Box::pin(async {})
     }));
 
@@ -408,7 +476,6 @@ async fn webrtc_accept(app: AppHandle, code: String) -> Result<String, String> {
         .await
         .ok_or("Kein Local-Description-Stand")?;
     let code = encode_desc(&desc)?;
-    *app.state::<NetState>().pc.lock().unwrap() = Some(pc);
     Ok(code)
 }
 
@@ -533,6 +600,7 @@ pub fn run() {
             pc: Mutex::new(None),
             mdns: Mutex::new(None),
             mdns_fullname: Mutex::new(None),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
             read_file,
