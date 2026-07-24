@@ -254,6 +254,49 @@ body,
   outline: 2px solid currentColor;
 }
 
+#log-panel {
+  border-top: 1px solid light-dark(#ddd, #333);
+  background: light-dark(#fafafa, #161616);
+  max-height: 30vh;
+  display: flex;
+  flex-direction: column;
+}
+
+#log-panel[hidden] {
+  display: none;
+}
+
+#log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.75rem;
+  color: light-dark(#777, #999);
+}
+
+#log-head button {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid light-dark(#ccc, #444);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+#log-text {
+  margin: 0;
+  padding: 0.25rem 0.75rem 0.5rem;
+  overflow: auto;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#btn-log,
 #btn-colors {
   padding: 0.05rem 0.5rem;
   border: 1px solid light-dark(#ccc, #444);

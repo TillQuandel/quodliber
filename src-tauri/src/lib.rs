@@ -232,11 +232,12 @@ async fn new_pc(app: &AppHandle) -> Result<Arc<RTCPeerConnection>, String> {
         .map_err(|e| e.to_string())
         .map(Arc::new)?;
 
-    // Verbindungsabbrüche nach dem Aufbau sichtbar machen
+    // Verbindungsabbrüche nach dem Aufbau sichtbar machen + Zustände loggen
     let app2 = app.clone();
     pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
         let app3 = app2.clone();
         Box::pin(async move {
+            let _ = app3.emit("net-log", format!("PeerConnection: {s}"));
             if matches!(
                 s,
                 RTCPeerConnectionState::Failed
@@ -247,6 +248,13 @@ async fn new_pc(app: &AppHandle) -> Result<Arc<RTCPeerConnection>, String> {
                 *st.outgoing.lock().unwrap() = None;
                 emit_status(&app3, "disconnected");
             }
+        })
+    }));
+    let app_ice = app.clone();
+    pc.on_ice_connection_state_change(Box::new(move |s| {
+        let app3 = app_ice.clone();
+        Box::pin(async move {
+            let _ = app3.emit("net-log", format!("ICE: {s}"));
         })
     }));
     Ok(pc)

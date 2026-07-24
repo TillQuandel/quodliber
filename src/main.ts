@@ -40,6 +40,9 @@ const MSG_REJECT = 5;
 // Heartbeat: beide Seiten pingen; jeder Empfang zählt als Lebenszeichen —
 // bleibt der Kanal >15 s stumm, gilt er als eingeschlafen (Half-Open-TCP etc.)
 const MSG_PING = 6;
+// PONG mit Sequenznummer für die RTT-Anzeige (alte Clients pingen ohne
+// Payload und antworten nicht — dann bleibt die Anzeige einfach leer)
+const MSG_PONG = 7;
 const SESSION_PORT = 41420;
 const PING_MS = 5000;
 const STALE_MS = 15000;
@@ -105,6 +108,10 @@ let guestBaselinePending = false;
 let inetAwaitingAnswer = false;
 let hostTransport: "tcp" | "inet" | null = null;
 let lastRecv = 0;
+let pingSeq = 0;
+const pingSent = new Map<number, number>();
+let lastRtt: number | null = null;
+let fullSessionCode: string | null = null;
 let pingTimer: number | undefined;
 let watchdogTimer: number | undefined;
 let rejoinTimer: number | undefined;
@@ -142,6 +149,10 @@ const el = {
   newTab: document.querySelector<HTMLButtonElement>("#btn-new-tab")!,
   shareTab: document.querySelector<HTMLButtonElement>("#btn-share-tab")!,
   kick: document.querySelector<HTMLButtonElement>("#btn-kick")!,
+  logToggle: document.querySelector<HTMLButtonElement>("#btn-log")!,
+  logPanel: document.querySelector<HTMLDivElement>("#log-panel")!,
+  logText: document.querySelector<HTMLPreElement>("#log-text")!,
+  logCopy: document.querySelector<HTMLButtonElement>("#btn-log-copy")!,
 };
 
 // Aktuell verbundener Gast (Host-Sicht) — für Kick + Vertrauensentzug
@@ -165,8 +176,29 @@ function status(msg: string, isError = false) {
   el.statusMsg.classList.toggle("error", isError);
 }
 
+let connBase = "offline";
 function connStatus(text: string) {
-  el.statusConn.textContent = text;
+  connBase = text;
+  renderConnStatus();
+}
+function renderConnStatus() {
+  el.statusConn.textContent =
+    connBase === "verbunden" && lastRtt !== null
+      ? `verbunden · ${Math.max(1, Math.round(lastRtt))} ms`
+      : connBase;
+}
+
+// --- Log-Konsole: Ereignis-Puffer + einblendbares Panel ---
+const logBuf: string[] = [];
+function qlog(msg: string) {
+  const ts = new Date().toLocaleTimeString();
+  logBuf.push(`[${ts}] ${msg}`);
+  if (logBuf.length > 500) logBuf.shift();
+  if (!el.logPanel.hidden) renderLog();
+}
+function renderLog() {
+  el.logText.textContent = logBuf.join("\n");
+  el.logText.scrollTop = el.logText.scrollHeight;
 }
 
 function currentName(): string {
@@ -460,8 +492,9 @@ async function autosave(tab: Tab) {
     } else if (tab === sessionTab && recoveryPath && text.length > 0) {
       await invoke("write_file", { path: recoveryPath, contents: text });
     }
-  } catch {
-    // Autosave scheitert still — expliziter Strg+S-Pfad meldet Fehler sichtbar
+  } catch (e) {
+    // Nicht in die Statuszeile (Tipp-Fluss), aber ins Log
+    qlog(`Autosave-Fehler: ${String(e)}`);
   }
 }
 
@@ -570,6 +603,7 @@ function acceptPeer(peer: { id: string; name: string }) {
   pendingHello = null;
   el.joinBanner.hidden = true;
   authorized = true;
+  qlog(`Beitritt bestätigt: „${peer.name}" — Sync startet`);
   connStatus("verbunden");
   sendControl(MSG_WELCOME, null);
   sendHandshake();
@@ -602,6 +636,25 @@ function handleIncoming(data: Uint8Array) {
     if (!t) return;
     awarenessProtocol.applyAwarenessUpdate(t.awareness, decoding.readVarUint8Array(dec), "remote");
   } else if (type === MSG_PING) {
+    // Neue Clients pingen mit Sequenznummer → PONG für die RTT-Messung
+    if (decoding.hasContent(dec)) {
+      const seq = decoding.readVarUint(dec);
+      const enc = encoding.createEncoder();
+      encoding.writeVarUint(enc, MSG_PONG);
+      encoding.writeVarUint(enc, seq);
+      rawSend(encoding.toUint8Array(enc));
+    }
+    return;
+  } else if (type === MSG_PONG) {
+    if (decoding.hasContent(dec)) {
+      const seq = decoding.readVarUint(dec);
+      const t0 = pingSent.get(seq);
+      if (t0 !== undefined) {
+        pingSent.delete(seq);
+        lastRtt = performance.now() - t0;
+        renderConnStatus();
+      }
+    }
     return;
   } else if (type === MSG_HELLO) {
     if (mode !== "hosting") {
@@ -617,6 +670,7 @@ function handleIncoming(data: Uint8Array) {
       return;
     }
     const peer = { id: hello.id ?? "", name: (hello.name ?? "Unbekannt").slice(0, 24) };
+    qlog(`HELLO von „${peer.name}"`);
     if (peer.id && knownPeers()[peer.id]) {
       acceptPeer(peer);
       status(`${peer.name} (bekannt) beigetreten`);
@@ -628,6 +682,7 @@ function handleIncoming(data: Uint8Array) {
   } else if (type === MSG_WELCOME) {
     if (mode !== "joined") return;
     authorized = true;
+    qlog("WELCOME vom Host — Sync startet");
     sendHandshake();
     connStatus("verbunden");
     updateSessionUi();
@@ -644,6 +699,7 @@ function handleIncoming(data: Uint8Array) {
     } else if (hostGuid !== guid) {
       // Host teilt ein ANDERES Dokument: Merge wäre Historien-Mix — frisch adoptieren
       hostGuid = guid;
+      qlog("Host teilt neues Dokument (GUID-Wechsel) — adoptiere frisch");
       replaceDoc(t, "");
       t.path = null;
       guestBaselinePending = true;
@@ -660,8 +716,15 @@ function startHeartbeat() {
   stopHeartbeat();
   lastRecv = Date.now();
   pingTimer = window.setInterval(() => {
+    pingSeq++;
+    pingSent.set(pingSeq, performance.now());
+    if (pingSent.size > 20) {
+      const oldest = pingSent.keys().next().value;
+      if (oldest !== undefined) pingSent.delete(oldest);
+    }
     const enc = encoding.createEncoder();
     encoding.writeVarUint(enc, MSG_PING);
+    encoding.writeVarUint(enc, pingSeq);
     rawSend(encoding.toUint8Array(enc));
   }, PING_MS);
   watchdogTimer = window.setInterval(() => {
@@ -698,6 +761,7 @@ function handleStale() {
   authorized = false;
   stopHeartbeat();
   clearRemoteAwareness();
+  qlog(`Heartbeat: Kanal ${STALE_MS / 1000}s stumm — behandle als tot`);
   status("Verbindung eingeschlafen — stelle neu her …", true);
   if (mode === "joined") {
     void invoke("leave_session").catch(() => {});
@@ -829,6 +893,12 @@ async function hostInternet() {
     refreshAuthorUi();
     updateSessionUi();
     connStatus("warte auf Antwort-Code …");
+    qlog("Internet-Code erzeugt (Offer, Gathering complete)");
+    // Sichtbar UND in der Zwischenablage — lautloses Kopieren wurde im
+    // Remote-Test übersehen (Klick auf die Anzeige kopiert erneut)
+    fullSessionCode = code;
+    el.sessionCode.textContent = `${code.slice(0, 16)}… (Klick kopiert)`;
+    el.sessionCode.title = "Klick: kompletten Code kopieren";
     copyCode(code, "Internet-Code");
   } catch (e) {
     status(String(e), true);
@@ -873,6 +943,10 @@ async function joinSession() {
       const answer = await invoke<string>("webrtc_accept", { code: addr });
       lastJoinedAddr = addr;
       el.joinInput.value = "";
+      qlog("Antwort-Code erzeugt (Answer, Gathering complete)");
+      fullSessionCode = answer;
+      el.sessionCode.textContent = `${answer.slice(0, 16)}… (Klick kopiert)`;
+      el.sessionCode.title = "Klick: kompletten Antwort-Code kopieren";
       copyCode(answer, "Antwort-Code");
       connStatus("warte auf Host …");
     } catch (e) {
@@ -932,6 +1006,8 @@ async function leaveSession() {
   lastJoinedAddr = null;
   guestBaselinePending = false;
   inetAwaitingAnswer = false;
+  fullSessionCode = null;
+  lastRtt = null;
   clearRemoteAwareness();
   sessionTab = null; // Tab bleibt als normaler Tab bestehen (Kopie beim Gast)
   updateFileLabel();
@@ -976,6 +1052,8 @@ void listen<string>("lan-removed", (e) => {
   renderLanList();
 });
 
+void listen<string>("net-log", (e) => qlog(`[rust] ${e.payload}`));
+
 void listen<string>("net-status", (e) => {
   const s = e.payload;
   if (s === "connected") {
@@ -984,6 +1062,7 @@ void listen<string>("net-status", (e) => {
     inetAwaitingAnswer = false;
     cancelRejoin();
     startHeartbeat();
+    qlog("Kanal verbunden — Beitritts-Handshake läuft");
     updateSessionUi();
     if (mode === "joined") {
       connStatus("warte auf Bestätigung des Hosts …");
@@ -993,15 +1072,30 @@ void listen<string>("net-status", (e) => {
     }
   } else if (s === "listening") {
     connected = false;
+    qlog("TCP-Listener aktiv (Port 41420) + mDNS-Ansage");
     connStatus("wartet auf Peer …");
   } else if (s === "disconnected") {
     connected = false;
     authorized = false;
     pendingHello = null;
     currentPeer = null;
+    lastRtt = null;
     el.joinBanner.hidden = true;
     stopHeartbeat();
     clearRemoteAwareness();
+    qlog("Verbindung getrennt");
+    // Internet-Sessions sind Einmal-Material: ehrliche Meldung + sauberer
+    // Leerlauf statt irreführendem "wartet auf Peer" (Remote-Test-Fund)
+    const wasInetHost = mode === "hosting" && hostTransport === "inet";
+    const wasInetGuest = mode === "joined" && lastJoinedAddr?.startsWith(CODE_PREFIX) === true;
+    if (wasInetHost || wasInetGuest) {
+      void leaveSession();
+      status(
+        "Internet-Verbindung fehlgeschlagen oder getrennt — neuen Code erzeugen (bei wiederholtem Scheitern: eine Seite per Handy-Hotspot)",
+        true,
+      );
+      return;
+    }
     if (mode === "hosting") {
       connStatus("wartet auf Peer …");
     } else if (mode === "joined") {
@@ -1037,13 +1131,23 @@ el.shareTab.addEventListener("click", () => {
   status("Dieser Tab wird jetzt geteilt");
 });
 el.sessionCode.addEventListener("click", () => {
-  const code = el.sessionCode.textContent;
+  const code = fullSessionCode ?? el.sessionCode.textContent;
   if (code) copyCode(code, "Code");
 });
 el.colorsToggle.addEventListener("click", () => {
   const on = toggleColoring();
   el.colorsToggle.textContent = on ? "Farben aus" : "Farben an";
   refreshAuthorUi();
+});
+el.logToggle.addEventListener("click", () => {
+  el.logPanel.hidden = !el.logPanel.hidden;
+  if (!el.logPanel.hidden) renderLog();
+});
+el.logCopy.addEventListener("click", () => {
+  void navigator.clipboard.writeText(logBuf.join("\n")).then(
+    () => status("Log kopiert"),
+    () => status("Log-Kopieren fehlgeschlagen", true),
+  );
 });
 el.nameInput.value =
   sessionStorage.getItem(NAME_STORAGE_KEY) ?? localStorage.getItem(NAME_STORAGE_KEY) ?? "";

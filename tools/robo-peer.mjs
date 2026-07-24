@@ -142,6 +142,13 @@ function connect() {
       } else if (type === MSG_REJECT) {
         console.error("[robo] Host hat abgelehnt — Ende");
         process.exit(1);
+      } else if (type === 6 && decoding.hasContent(dec)) {
+        // PING mit Sequenz → PONG für die RTT-Anzeige der Gegenseite
+        const seq = decoding.readVarUint(dec);
+        const enc = encoding.createEncoder();
+        encoding.writeVarUint(enc, 7);
+        encoding.writeVarUint(enc, seq);
+        sendFrame(encoding.toUint8Array(enc));
       }
       // MSG_META (2) ignorieren — Robo joint immer frisch
     }

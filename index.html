@@ -41,11 +41,19 @@
         <button id="btn-recover-dismiss">Verwerfen</button>
       </div>
       <main id="editor"></main>
+      <div id="log-panel" hidden>
+        <div id="log-head">
+          <span>Log</span>
+          <button id="btn-log-copy" title="Gesamtes Log in die Zwischenablage">Kopieren</button>
+        </div>
+        <pre id="log-text"></pre>
+      </div>
       <footer id="statusbar">
         <span id="status-conn" class="muted">offline</span>
         <span id="role-info" class="muted"></span>
         <span id="author-legend"></span>
         <button id="btn-colors" title="Autoren-Markierungen ein-/ausblenden">Farben aus</button>
+        <button id="btn-log" title="Log-/Debug-Konsole ein-/ausblenden">Log</button>
         <span id="status-msg" class="muted"></span>
       </footer>
     </div>
