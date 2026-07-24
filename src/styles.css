@@ -275,6 +275,56 @@ body,
   color: light-dark(#777, #999);
 }
 
+#trust-panel {
+  border-top: 1px solid light-dark(#ddd, #333);
+  background: light-dark(#fafafa, #161616);
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+#trust-panel[hidden] {
+  display: none;
+}
+
+#trust-list {
+  padding: 0.25rem 0.75rem 0.6rem;
+  font-size: 0.78rem;
+}
+
+.trust-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.25rem 0;
+  border-top: 1px solid light-dark(#eee, #262626);
+}
+
+.trust-row .trust-name {
+  font-weight: 600;
+}
+
+.trust-row .trust-id {
+  color: light-dark(#888, #888);
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+.trust-row .trust-docs {
+  flex: 1;
+  color: light-dark(#555, #aaa);
+  word-break: break-all;
+}
+
+.trust-row button {
+  padding: 0.1rem 0.5rem;
+  border: 1px solid light-dark(#ccc, #444);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
 #log-head button {
   padding: 0.1rem 0.5rem;
   border: 1px solid light-dark(#ccc, #444);

@@ -14,6 +14,12 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import {
+  forgetPeer as trustForget,
+  isTrusted,
+  knownPeers,
+  rememberPeer as trustRemember,
+} from "./trust";
+import {
   authorColoring,
   authorRuns,
   authorsRefresh,
@@ -52,7 +58,6 @@ const CODE_PREFIX = "QL1-";
 // Persistente Install-Identität (v0: zufällige ID, keine Kryptografie —
 // spoofbar, fürs LAN-/Bekannten-Szenario akzeptiert; echte Schlüssel später)
 const IDENTITY_KEY = "quodliber-id";
-const KNOWN_KEY = "quodliber-known-peers";
 const NAME_STORAGE_KEY = "quodliber-name";
 const myId = (() => {
   let v = localStorage.getItem(IDENTITY_KEY);
@@ -63,17 +68,11 @@ const myId = (() => {
   return v;
 })();
 
-function knownPeers(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem(KNOWN_KEY) ?? "{}") as Record<string, string>;
-  } catch {
-    return {};
-  }
-}
-function rememberPeer(id: string, name: string) {
-  const k = knownPeers();
-  k[id] = name;
-  localStorage.setItem(KNOWN_KEY, JSON.stringify(k));
+// Vertrauensmodell in src/trust.ts (dort auch die Begründung der
+// Datei-statt-GUID-Bindung); hier nur die Anbindung samt Listen-Anzeige.
+function rememberPeer(id: string, name: string, path: string | null) {
+  trustRemember(id, name, path);
+  renderTrustList();
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +156,68 @@ const el = {
   logPanel: document.querySelector<HTMLDivElement>("#log-panel")!,
   logText: document.querySelector<HTMLPreElement>("#log-text")!,
   logCopy: document.querySelector<HTMLButtonElement>("#btn-log-copy")!,
+  trustToggle: document.querySelector<HTMLButtonElement>("#btn-trust")!,
+  trustPanel: document.querySelector<HTMLDivElement>("#trust-panel")!,
+  trustList: document.querySelector<HTMLDivElement>("#trust-list")!,
 };
 
 // Aktuell verbundener Gast (Host-Sicht) — für Kick + Vertrauensentzug
 let currentPeer: { id: string; name: string } | null = null;
 
 function forgetPeer(id: string) {
-  const k = knownPeers();
-  delete k[id];
-  localStorage.setItem(KNOWN_KEY, JSON.stringify(k));
+  trustForget(id);
+  renderTrustList();
+}
+
+/// Vertrauensliste sichtbar machen: bisher war nur über „Gast trennen"
+/// überhaupt ein Entzug möglich, und auch nur für den gerade Verbundenen.
+function renderTrustList() {
+  const list = knownPeers();
+  el.trustList.replaceChildren();
+  const ids = Object.keys(list);
+  if (ids.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = "Noch niemand dauerhaft zugelassen.";
+    el.trustList.appendChild(empty);
+    return;
+  }
+  for (const id of ids) {
+    const entry = list[id];
+    const row = document.createElement("div");
+    row.className = "trust-row";
+
+    const name = document.createElement("span");
+    name.className = "trust-name";
+    name.textContent = entry.name;
+    row.appendChild(name);
+
+    const idEl = document.createElement("span");
+    idEl.className = "trust-id";
+    idEl.textContent = id.slice(0, 8);
+    idEl.title = id;
+    row.appendChild(idEl);
+
+    const docs = document.createElement("span");
+    docs.className = "trust-docs";
+    docs.textContent =
+      entry.paths.length > 0
+        ? entry.paths.map((p) => p.split(/[\\/]/).pop() || p).join(", ")
+        : "keine Datei freigegeben — wird beim Beitritt gefragt";
+    docs.title = entry.paths.join("\n");
+    row.appendChild(docs);
+
+    const del = document.createElement("button");
+    del.textContent = "entfernen";
+    del.title = "Vertrauen entziehen — nächster Beitritt braucht wieder Bestätigung";
+    del.addEventListener("click", () => {
+      forgetPeer(id);
+      status(`Vertrauen für „${entry.name}" entzogen`);
+    });
+    row.appendChild(del);
+
+    el.trustList.appendChild(row);
+  }
 }
 
 // Autoren-Register für die Legende: clientID → Name (lebt pro Session-Doc)
@@ -670,7 +722,9 @@ function sendHandshake() {
 }
 
 function acceptPeer(peer: { id: string; name: string }) {
-  if (peer.id) rememberPeer(peer.id, peer.name);
+  // Freigabe gilt für die gerade geteilte Datei; bei pfadlosem Tab wird nur
+  // der Name gemerkt (kein dauerhafter Zutritt)
+  if (peer.id) rememberPeer(peer.id, peer.name, sessionTab?.path ?? null);
   currentPeer = peer;
   pendingHello = null;
   el.joinBanner.hidden = true;
@@ -762,9 +816,9 @@ function handleIncoming(data: Uint8Array) {
     }
     const peer = { id: hello.id ?? "", name: (hello.name ?? "Unbekannt").slice(0, 24) };
     qlog(`HELLO von „${peer.name}"`);
-    if (peer.id && knownPeers()[peer.id]) {
+    if (peer.id && isTrusted(peer.id, sessionTab?.path ?? null)) {
       acceptPeer(peer);
-      status(`${peer.name} (bekannt) beigetreten`);
+      status(`${peer.name} (für diese Datei bereits zugelassen) beigetreten`);
     } else {
       pendingHello = peer;
       el.jrText.textContent = `„${peer.name}" möchte der Session beitreten.`;
@@ -894,6 +948,9 @@ async function openFile() {
       sessionTab.path = path;
       captureBaseline(sessionTab.ydoc);
       refreshAuthorUi();
+      // Der verbundene Gast bleibt zugelassen und bekommt die neue Datei damit
+      // auch dauerhaft freigegeben — er sieht sie ohnehin bereits
+      if (currentPeer?.id && authorized) rememberPeer(currentPeer.id, currentPeer.name, path);
       if (connected) sendHandshake();
       status("Geöffnet — wird in der Session geteilt");
     } else {
@@ -1237,6 +1294,9 @@ el.shareTab.addEventListener("click", () => {
   authorNames.clear();
   captureBaseline(sessionTab.ydoc);
   refreshAuthorUi();
+  if (currentPeer?.id && authorized && sessionTab.path) {
+    rememberPeer(currentPeer.id, currentPeer.name, sessionTab.path);
+  }
   if (connected && authorized) sendHandshake();
   updateSessionUi();
   updateFileLabel();
@@ -1254,6 +1314,10 @@ el.colorsToggle.addEventListener("click", () => {
 el.logToggle.addEventListener("click", () => {
   el.logPanel.hidden = !el.logPanel.hidden;
   if (!el.logPanel.hidden) renderLog();
+});
+el.trustToggle.addEventListener("click", () => {
+  el.trustPanel.hidden = !el.trustPanel.hidden;
+  if (!el.trustPanel.hidden) renderTrustList();
 });
 el.logCopy.addEventListener("click", () => {
   void navigator.clipboard.writeText(logBuf.join("\n")).then(
