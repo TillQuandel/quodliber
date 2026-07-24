@@ -859,7 +859,12 @@ function handleStale() {
     scheduleRejoin();
   } else if (mode === "hosting" && hostTransport === "tcp") {
     void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId })
-      .then(() => connStatus("wartet auf Peer …"))
+      .then((code) => {
+        // Adresse nachziehen: nach dem Neuaufsetzen kann der Port abweichen
+        el.sessionCode.textContent = code;
+        qlog(`Session-Adresse: ${code}`);
+        connStatus("wartet auf Peer …");
+      })
       .catch((e) => status(String(e), true));
   } else if (mode === "hosting") {
     connStatus("Internet-Session tot — neuen Code erzeugen");
@@ -962,6 +967,9 @@ async function hostSession() {
     refreshAuthorUi();
     el.sessionCode.textContent = code;
     el.sessionCode.title = "Klick: Code kopieren";
+    // Der Port kann abweichen, wenn der Wunschport belegt war (zweite Instanz
+    // auf demselben Rechner) — deshalb die tatsächliche Adresse protokollieren
+    qlog(`Session-Adresse: ${code}`);
     updateSessionUi();
     status("Code an die Gegenseite geben — im LAN erscheint die Session automatisch");
   } catch (e) {
@@ -1176,7 +1184,7 @@ void listen<string>("net-status", (e) => {
     }
   } else if (s === "listening") {
     connected = false;
-    qlog("TCP-Listener aktiv (Port 41420) + mDNS-Ansage");
+    qlog("TCP-Listener aktiv + mDNS-Ansage");
     connStatus("wartet auf Peer …");
   } else if (s === "disconnected") {
     connected = false;
@@ -1282,7 +1290,12 @@ el.kick.addEventListener("click", () => {
   // die Verbindung host-seitig kappen und weiterlauschen
   window.setTimeout(() => {
     if (connected && mode === "hosting" && hostTransport === "tcp") {
-      void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId }).catch(() => {});
+      void invoke<string>("host_session", { port: SESSION_PORT, name: currentName(), id: myId })
+        .then((code) => {
+          el.sessionCode.textContent = code;
+          qlog(`Session-Adresse: ${code}`);
+        })
+        .catch(() => {});
     } else if (connected && mode === "hosting") {
       // Internet-Session kennt kein Weiterlauschen: den Kanal hart kappen,
       // sonst bliebe ein Gast, der das REJECT ignoriert, dauerhaft verbunden

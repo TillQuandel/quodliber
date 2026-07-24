@@ -503,19 +503,30 @@ async fn host_session(
     id: String,
 ) -> Result<String, String> {
     leave_inner(&app);
-    // Kurzer Retry: der Task-Abort aus leave_inner gibt den Port asynchron frei —
-    // direktes Re-Hosting auf demselben Port darf daran nicht scheitern.
-    let listener = {
-        let mut attempt = 0;
-        loop {
-            match TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(l) => break l,
-                Err(_) if attempt < 10 => {
-                    attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Zuerst mehrfach der Wunschport: der Task-Abort aus leave_inner gibt ihn
+    // nur asynchron frei, direktes Re-Hosting darf daran nicht scheitern.
+    // Bleibt er belegt (zweite Instanz auf demselben Rechner), auf den nächsten
+    // freien Port ausweichen — Discovery und Verbindungscode tragen den Port
+    // ohnehin mit, ein fester Port ist also nicht nötig.
+    let mut bound: Option<(TcpListener, u16)> = None;
+    'search: for candidate in port..port.saturating_add(10) {
+        let attempts = if candidate == port { 10 } else { 1 };
+        for _ in 0..attempts {
+            match TcpListener::bind(("0.0.0.0", candidate)).await {
+                Ok(l) => {
+                    bound = Some((l, candidate));
+                    break 'search;
                 }
-                Err(e) => return Err(format!("Port {port}: {e}")),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
             }
+        }
+    }
+    let (listener, port) = match bound {
+        Some(v) => v,
+        None => {
+            return Err(format!(
+                "Kein freier Port ab {port} — läuft schon eine Session auf diesem Rechner?"
+            ))
         }
     };
     // Erst ansagen, wenn der Port wirklich steht — sonst bewirbt ein
