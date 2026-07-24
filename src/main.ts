@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -90,6 +91,9 @@ interface Tab {
   undoManager: Y.UndoManager;
   autosaveTimer: number | undefined;
   closeArmed: boolean;
+  // Länge des zuletzt auf die Platte geschriebenen Standes — Grundlage für den
+  // Schutz gegen automatisches Leerschreiben einer bestehenden Datei
+  lastSavedLen: number;
 }
 
 let nextTabId = 1;
@@ -302,6 +306,7 @@ function createTab(contents: string, path: string | null): Tab {
     undoManager: new Y.UndoManager(ytext),
     autosaveTimer: undefined,
     closeArmed: false,
+    lastSavedLen: path ? contents.length : 0,
   };
   registerTabObservers(tab);
   tabs.push(tab);
@@ -311,9 +316,15 @@ function createTab(contents: string, path: string | null): Tab {
 /// Doc eines Tabs in-place ersetzen (Session-Umschwenk: GUID-Wechsel,
 /// Datei-Wechsel des Hosts). Kein Merge mit Vorzustand — frische Historie.
 function replaceDoc(tab: Tab, contents: string) {
+  // Ausstehenden Autosave noch wegschreiben — das Doc wird gleich zerstört
+  void flushAutosave(tab);
   tab.awareness.destroy();
   tab.ydoc.destroy();
   clearTimeout(tab.autosaveTimer);
+  tab.autosaveTimer = undefined;
+  // Der neue Inhalt entspricht dem Stand auf der Platte (Host: frisch geöffnete
+  // Datei; Gast: leeres Doc) — Bezugsgröße für den Leer-Schutz mitziehen
+  tab.lastSavedLen = contents.length;
   tab.ydoc = new Y.Doc();
   tab.ytext = tab.ydoc.getText("content");
   if (contents.length > 0) tab.ytext.insert(0, contents);
@@ -368,9 +379,11 @@ function closeTab(tab: Tab) {
     status("");
     return;
   }
+  // Ausstehenden Autosave noch wegschreiben (Tabs MIT Pfad schließen sofort —
+  // ohne Flush wären bis zu 2 Sekunden Tipparbeit weg)
+  void flushAutosave(tab);
   tab.awareness.destroy();
   tab.ydoc.destroy();
-  clearTimeout(tab.autosaveTimer);
   const idx = tabs.indexOf(tab);
   tabs.splice(idx, 1);
   if (tab === sessionTab) sessionTab = null;
@@ -502,15 +515,37 @@ function clearRemoteAwareness() {
 
 function scheduleAutosave(tab: Tab) {
   clearTimeout(tab.autosaveTimer);
-  tab.autosaveTimer = window.setTimeout(() => void autosave(tab), 2000);
+  tab.autosaveTimer = window.setTimeout(() => {
+    tab.autosaveTimer = undefined;
+    void autosave(tab);
+  }, 2000);
 }
 
-async function autosave(tab: Tab) {
+/// Ausstehenden Autosave sofort schreiben statt verwerfen: sonst gehen bis zu
+/// 2 Sekunden Tipparbeit verloren, wenn ein Tab geschlossen, das Doc ersetzt
+/// oder das Fenster geschlossen wird. Der Textstand wird synchron gezogen —
+/// die Aufrufer zerstören das Doc unmittelbar danach.
+function flushAutosave(tab: Tab): Promise<void> {
+  if (tab.autosaveTimer === undefined) return Promise.resolve();
+  clearTimeout(tab.autosaveTimer);
+  tab.autosaveTimer = undefined;
+  return autosave(tab, tab.ytext.toString());
+}
+
+async function autosave(tab: Tab, snapshot?: string) {
   if (!tabs.includes(tab)) return;
-  const text = tab.ytext.toString();
+  const text = snapshot ?? tab.ytext.toString();
   try {
     if (tab.path) {
+      // Eine bestehende Datei nie automatisch leeren: die Gegenseite kann den
+      // Text komplett löschen, und fremde Edits sind beim Host nicht per
+      // Strg+Z zurückholbar (Undo trackt nur die eigene Origin)
+      if (text.length === 0 && tab.lastSavedLen > 0) {
+        status("Dokument ist leer — nicht automatisch gespeichert (Strg+S speichert bewusst)", true);
+        return;
+      }
       await invoke("write_file", { path: tab.path, contents: text });
+      tab.lastSavedLen = text.length;
       if (tab === active && (!el.statusMsg.textContent || el.statusMsg.textContent.startsWith("Auto"))) {
         status(`Auto-gespeichert ${new Date().toLocaleTimeString()}`);
       }
@@ -866,9 +901,11 @@ async function saveFile() {
     if (typeof chosen !== "string") return;
     path = chosen;
   }
+  const contents = tab.ytext.toString();
   try {
-    await invoke("write_file", { path, contents: tab.ytext.toString() });
+    await invoke("write_file", { path, contents });
     tab.path = path;
+    tab.lastSavedLen = contents.length;
     updateFileLabel();
     updateTabBar();
     status("Gespeichert");
@@ -1042,6 +1079,7 @@ async function leaveSession() {
   fullSessionCode = null;
   lastRtt = null;
   clearRemoteAwareness();
+  if (sessionTab) void flushAutosave(sessionTab);
   sessionTab = null; // Tab bleibt als normaler Tab bestehen (Kopie beim Gast)
   updateFileLabel();
   updateSessionUi();
@@ -1268,6 +1306,25 @@ el.recoverDismiss.addEventListener("click", () => {
     void invoke("write_file", { path: recoveryPath, contents: "" }).catch(() => {});
   }
   el.recoveryBanner.hidden = true;
+});
+
+// Fenster-Schließen: den ausstehenden Autosave aller Tabs noch wegschreiben.
+// Das Schließen darf daran nie scheitern — deshalb Zeitlimit und zwei Wege.
+let closing = false;
+void getCurrentWindow().onCloseRequested(async (e) => {
+  if (closing) return; // zweiter Durchlauf: normal schließen lassen
+  e.preventDefault();
+  closing = true;
+  try {
+    await Promise.race([
+      Promise.all(tabs.map((t) => flushAutosave(t))),
+      new Promise((r) => window.setTimeout(r, 1500)),
+    ]);
+  } catch {
+    // Ein Schreibfehler darf das Schließen nicht blockieren
+  }
+  const win = getCurrentWindow();
+  void win.close().catch(() => void win.destroy().catch(() => {}));
 });
 
 window.addEventListener("keydown", (e) => {
