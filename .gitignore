@@ -26,3 +26,8 @@ dist-ssr
 # Lokale/persönliche Artefakte — nie pushen
 graphify-out/
 tools/robo-final.txt
+
+# Nachweis-Client zum Autorisierungs-Fix (umgeht den Beitritts-Handshake
+# absichtlich). Vorerst lokal — als Regressionstest aufnehmen ist eine
+# bewusste Entscheidung, weil das Repo öffentlich ist.
+tools/rogue-peer.mjs
