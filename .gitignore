@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Lokale/persönliche Artefakte — nie pushen
+graphify-out/
+tools/robo-final.txt
