@@ -9,6 +9,12 @@ Two people (more planned) type simultaneously in the same document —
 character-granular, with live cursors, per-author coloring, and lossless
 merging after connection drops (Yjs CRDT).
 
+> [!WARNING]
+> **Experimental — not for important data yet.** Early-stage (v0.1),
+> unsigned binaries, limited real-world testing. Internet sessions are
+> DTLS-encrypted; the LAN/TCP path is currently **unencrypted** (see
+> [ROADMAP.md](ROADMAP.md)). Keep backups of anything you edit with it.
+
 ## Connecting
 
 - **LAN:** The host clicks "Session starten" — guests see the session appear
