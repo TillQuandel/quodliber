@@ -315,7 +315,8 @@ body,
   word-break: break-all;
 }
 
-.trust-row button {
+.trust-row button,
+.trust-doc-row button {
   padding: 0.1rem 0.5rem;
   border: 1px solid light-dark(#ccc, #444);
   border-radius: 6px;
@@ -323,6 +324,25 @@ body,
   color: inherit;
   font-size: 0.72rem;
   cursor: pointer;
+}
+
+.trust-doc-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.1rem 0 0.1rem 1.2rem;
+  font-size: 0.75rem;
+}
+
+.trust-doc-row .trust-doc-name {
+  flex: 1;
+  word-break: break-all;
+}
+
+.trust-doc-row .trust-since {
+  color: light-dark(#888, #888);
+  font-size: 0.7rem;
+  white-space: nowrap;
 }
 
 #log-head button {

@@ -12,7 +12,9 @@ globalThis.localStorage = {
   clear: () => store.clear(),
 };
 
-const { knownPeers, rememberPeer, isTrusted, forgetPeer } = await import("../src/trust.ts");
+const { knownPeers, rememberPeer, isTrusted, forgetPeer, forgetPath } = await import(
+  "../src/trust.ts"
+);
 
 const KEY = "quodliber-known-peers";
 const DOC_A = "C:\\Texte\\roman.md";
@@ -34,12 +36,38 @@ assert.equal(isTrusted(PEER, DOC_B), false, "andere Datei muss nachfragen");
 
 // 3) Zweite Datei kommt hinzu, erste bleibt
 rememberPeer(PEER, "Testgast", DOC_B);
-assert.deepEqual(knownPeers()[PEER].paths, [DOC_A, DOC_B], "beide Pfade gemerkt");
+assert.deepEqual(
+  knownPeers()[PEER].paths.map((d) => d.path),
+  [DOC_A, DOC_B],
+  "beide Pfade gemerkt",
+);
 assert.equal(isTrusted(PEER, DOC_A), true, "erste Datei bleibt zugelassen");
 
 // 4) Doppelte Zulassung erzeugt keinen doppelten Eintrag
 rememberPeer(PEER, "Testgast", DOC_A);
 assert.equal(knownPeers()[PEER].paths.length, 2, "keine Duplikate");
+
+// 4b) Jede Freigabe trägt einen brauchbaren Zeitpunkt
+for (const doc of knownPeers()[PEER].paths) {
+  assert.ok(doc.since, "Freigabe hat einen Zeitpunkt");
+  assert.ok(!Number.isNaN(Date.parse(doc.since)), "Zeitpunkt ist lesbar");
+}
+
+// 4c) Einzelne Datei zurücknehmen lässt die andere unberührt
+forgetPath(PEER, DOC_A);
+assert.equal(isTrusted(PEER, DOC_A), false, "zurückgenommene Datei sperrt");
+assert.equal(isTrusted(PEER, DOC_B), true, "andere Freigabe bleibt bestehen");
+
+// 4d) Die letzte Freigabe zurücknehmen entfernt den ganzen Eintrag
+forgetPath(PEER, DOC_B);
+assert.equal(knownPeers()[PEER], undefined, "Eintrag ohne Freigaben verschwindet");
+
+// 4e) Unbekannte Kombination zurücknehmen darf nichts kaputt machen
+reset();
+rememberPeer(PEER, "Testgast", DOC_A);
+forgetPath("gibt-es-nicht", DOC_A);
+forgetPath(PEER, "C:\\nie\\freigegeben.md");
+assert.equal(isTrusted(PEER, DOC_A), true, "bestehende Freigabe unangetastet");
 
 // 5) Tab ohne Pfad öffnet keine dauerhafte Tür
 reset();
@@ -55,11 +83,18 @@ rememberPeer(PEER, "Testgast", DOC_A);
 forgetPeer(PEER);
 assert.equal(isTrusted(PEER, DOC_A), false, "nach Entzug wieder Nachfrage");
 
-// 7) Altformat { id: name } wird gelesen, gewährt aber keinen Zutritt
+// 7) Ältestes Format { id: name } wird gelesen, gewährt aber keinen Zutritt
 reset();
 store.set(KEY, JSON.stringify({ "alt-peer": "Robo" }));
 assert.equal(knownPeers()["alt-peer"].name, "Robo", "Altformat-Name übernommen");
 assert.equal(isTrusted("alt-peer", DOC_A), false, "Altformat muss neu bestätigt werden");
+
+// 7b) Zwischenformat (Pfade ohne Datum) bleibt gültig, nur ohne Zeitangabe
+reset();
+store.set(KEY, JSON.stringify({ [PEER]: { name: "Testgast", paths: [DOC_A] } }));
+assert.equal(isTrusted(PEER, DOC_A), true, "Freigabe aus dem Zwischenformat gilt weiter");
+assert.equal(knownPeers()[PEER].paths[0].since, "", "fehlendes Datum bleibt leer");
+assert.equal(isTrusted(PEER, DOC_B), false, "und öffnet keine andere Datei");
 
 // 8) Kaputter Speicherinhalt darf nicht sprengen
 reset();
@@ -74,4 +109,6 @@ reset();
 rememberPeer("", "Namenlos", DOC_A);
 assert.equal(isTrusted("", DOC_A), false, "leere ID lässt nie durch");
 
-console.log("OK Vertrauensliste — 9 Fälle: Datei-Bindung, pfadlose Session, Entzug, Altformat, Schrott-Eingaben");
+console.log(
+  "OK Vertrauensliste — 14 Fälle: Datei-Bindung, Freigabe-Zeitpunkt, Einzel-Entzug, pfadlose Session, Alt- und Zwischenformat, Schrott-Eingaben",
+);

@@ -14,6 +14,7 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import {
+  forgetPath as trustForgetPath,
   forgetPeer as trustForget,
   isTrusted,
   knownPeers,
@@ -169,6 +170,11 @@ function forgetPeer(id: string) {
   renderTrustList();
 }
 
+function forgetPath(id: string, path: string) {
+  trustForgetPath(id, path);
+  renderTrustList();
+}
+
 /// Vertrauensliste sichtbar machen: bisher war nur über „Gast trennen"
 /// überhaupt ein Entzug möglich, und auch nur für den gerade Verbundenen.
 function renderTrustList() {
@@ -198,25 +204,55 @@ function renderTrustList() {
     idEl.title = id;
     row.appendChild(idEl);
 
-    const docs = document.createElement("span");
-    docs.className = "trust-docs";
-    docs.textContent =
-      entry.paths.length > 0
-        ? entry.paths.map((p) => p.split(/[\\/]/).pop() || p).join(", ")
-        : "keine Datei freigegeben — wird beim Beitritt gefragt";
-    docs.title = entry.paths.join("\n");
-    row.appendChild(docs);
+    const spacer = document.createElement("span");
+    spacer.className = "trust-docs";
+    row.appendChild(spacer);
 
-    const del = document.createElement("button");
-    del.textContent = "entfernen";
-    del.title = "Vertrauen entziehen — nächster Beitritt braucht wieder Bestätigung";
-    del.addEventListener("click", () => {
+    const delAll = document.createElement("button");
+    delAll.textContent = "alle entfernen";
+    delAll.title = "Sämtliche Freigaben dieser Person zurücknehmen";
+    delAll.addEventListener("click", () => {
       forgetPeer(id);
-      status(`Vertrauen für „${entry.name}" entzogen`);
+      status(`Alle Freigaben für „${entry.name}" entzogen`);
     });
-    row.appendChild(del);
-
+    row.appendChild(delAll);
     el.trustList.appendChild(row);
+
+    if (entry.paths.length === 0) {
+      const none = document.createElement("div");
+      none.className = "trust-doc-row muted";
+      none.textContent = "keine Datei freigegeben — wird beim Beitritt gefragt";
+      el.trustList.appendChild(none);
+      continue;
+    }
+
+    for (const doc of entry.paths) {
+      const docRow = document.createElement("div");
+      docRow.className = "trust-doc-row";
+
+      const file = document.createElement("span");
+      file.className = "trust-doc-name";
+      file.textContent = doc.path.split(/[\\/]/).pop() || doc.path;
+      file.title = doc.path;
+      docRow.appendChild(file);
+
+      const since = document.createElement("span");
+      since.className = "trust-since";
+      since.textContent = doc.since ? `seit ${new Date(doc.since).toLocaleDateString()}` : "";
+      since.title = doc.since ? new Date(doc.since).toLocaleString() : "";
+      docRow.appendChild(since);
+
+      const delOne = document.createElement("button");
+      delOne.textContent = "×";
+      delOne.title = "Nur diese Datei-Freigabe zurücknehmen";
+      delOne.addEventListener("click", () => {
+        forgetPath(id, doc.path);
+        status(`Freigabe „${file.textContent}" für ${entry.name} zurückgenommen`);
+      });
+      docRow.appendChild(delOne);
+
+      el.trustList.appendChild(docRow);
+    }
   }
 }
 
@@ -948,9 +984,9 @@ async function openFile() {
       sessionTab.path = path;
       captureBaseline(sessionTab.ydoc);
       refreshAuthorUi();
-      // Der verbundene Gast bleibt zugelassen und bekommt die neue Datei damit
-      // auch dauerhaft freigegeben — er sieht sie ohnehin bereits
-      if (currentPeer?.id && authorized) rememberPeer(currentPeer.id, currentPeer.name, path);
+      // Der verbundene Gast bleibt zugelassen und zieht mit um — die neue Datei
+      // wandert aber bewusst NICHT in seine dauerhaften Freigaben: gemerkt wird
+      // nur, was per Beitritts-Banner bestätigt wurde
       if (connected) sendHandshake();
       status("Geöffnet — wird in der Session geteilt");
     } else {
@@ -1294,9 +1330,7 @@ el.shareTab.addEventListener("click", () => {
   authorNames.clear();
   captureBaseline(sessionTab.ydoc);
   refreshAuthorUi();
-  if (currentPeer?.id && authorized && sessionTab.path) {
-    rememberPeer(currentPeer.id, currentPeer.name, sessionTab.path);
-  }
+  // Wie beim Datei-Öffnen: Der Gast zieht mit um, ohne dauerhafte Freigabe
   if (connected && authorized) sendHandshake();
   updateSessionUi();
   updateFileLabel();
